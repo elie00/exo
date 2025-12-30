@@ -190,7 +190,10 @@ class Node:
 def main():
     args = Args.parse()
 
-    mp.set_start_method("spawn")
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass  # Already set, which is fine
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
     logger.info("Starting EXO")

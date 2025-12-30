@@ -152,7 +152,7 @@ uv run exo
 
 This starts the exo dashboard and API at http://localhost:52415/
 
-**Important note for Linux users:** Currently, exo runs on CPU on Linux. GPU support for Linux platforms is under development. If you'd like to see support for your specific Linux hardware, please [search for existing feature requests](https://github.com/exo-explore/exo/issues) or create a new one.
+**Important note for Linux users:** exo now includes experimental NVIDIA GPU support on Linux! See the [Linux NVIDIA GPU Support](#linux-nvidia-gpu-support) section below for setup instructions. If you'd like to see support for additional Linux hardware, please [search for existing feature requests](https://github.com/exo-explore/exo/issues) or create a new one.
 
 ### macOS App
 
@@ -293,7 +293,60 @@ For further details, see API types and endpoints in [src/exo/master/api.py](src/
 
 ## Hardware Accelerator Support
 
-On macOS, exo uses the GPU. On Linux, exo currently runs on CPU. We are working on extending hardware accelerator support. If you'd like support for a new hardware platform, please [search for an existing feature request](https://github.com/exo-explore/exo/issues) and add a thumbs up so we know what hardware is important to the community.
+- **macOS**: exo uses Metal GPU acceleration via MLX.
+- **Linux with NVIDIA GPU**: exo supports NVIDIA GPUs with CUDA. See [Linux NVIDIA GPU Support](#linux-nvidia-gpu-support) below.
+- **Linux without GPU**: exo falls back to CPU inference.
+
+If you'd like support for a new hardware platform, please [search for an existing feature request](https://github.com/exo-explore/exo/issues) and add a thumbs up so we know what hardware is important to the community.
+
+---
+
+## Linux NVIDIA GPU Support
+
+exo includes experimental support for NVIDIA GPUs on Linux. When running on a system with NVIDIA GPUs:
+
+- **Automatic Detection**: exo automatically detects NVIDIA GPUs and their available VRAM.
+- **GPU-Aware Placement**: Model shards are distributed across nodes based on available GPU memory (VRAM) when all nodes in a cluster have GPUs.
+- **Fallback to RAM**: For mixed clusters (some nodes with GPUs, some without), exo uses RAM-based placement for compatibility.
+
+### Requirements
+
+- Linux with NVIDIA GPU(s)
+- NVIDIA driver installed (version 470+)
+- CUDA toolkit (optional, but recommended for best performance)
+
+### Installation with CUDA Support
+
+```bash
+# Clone exo
+git clone https://github.com/exo-explore/exo
+cd exo
+
+# Install with CUDA support
+uv sync --extra cuda
+
+# Build dashboard
+cd dashboard && npm install && npm run build && cd ..
+
+# Run exo
+uv run exo
+```
+
+### Verifying GPU Detection
+
+When exo starts on a system with NVIDIA GPUs, you should see GPU information in the logs. The dashboard will also display GPU memory information for each node.
+
+### GPU Placement Preferences
+
+By default, exo prefers GPU VRAM over system RAM when placing model shards. You can control this behavior via the API:
+
+```bash
+# Get placement using GPU memory (default)
+curl "http://localhost:52415/instance/placement?model_id=llama-3.2-1b&prefer_gpu=true"
+
+# Get placement using system RAM
+curl "http://localhost:52415/instance/placement?model_id=llama-3.2-1b&prefer_gpu=false"
+```
 
 ---
 

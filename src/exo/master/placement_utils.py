@@ -28,19 +28,108 @@ def narrow_all_nodes(nodes: list[NodeInfo]) -> TypeGuard[list[NodeWithProfile]]:
     return all(node.node_profile is not None for node in nodes)
 
 
+def _get_node_effective_memory(
+    node: NodeWithProfile, prefer_gpu: bool = True
+) -> Memory:
+    """
+    Get the effective memory for a node (VRAM if GPU available and preferred, else RAM).
+
+    Args:
+        node: Node with performance profile
+        prefer_gpu: If True, prefer GPU VRAM over RAM when available
+
+    Returns:
+        Memory object representing effective available memory
+    """
+    if prefer_gpu and node.node_profile.system.has_gpu_memory:
+        return Memory.from_mb(node.node_profile.system.gpu_memory_available_mb)
+    return node.node_profile.memory.ram_available
+
+
+def _get_cycle_effective_memory(
+    cycle: list[NodeWithProfile], prefer_gpu: bool = True
+) -> Memory:
+    """
+    Get the total effective memory for a cycle.
+
+    If prefer_gpu is True and ALL nodes have GPU memory, uses VRAM.
+    Otherwise uses RAM.
+
+    Args:
+        cycle: List of nodes with performance profiles
+        prefer_gpu: If True, prefer GPU VRAM over RAM when available
+
+    Returns:
+        Total Memory available in the cycle
+    """
+    # Check if all nodes have GPU memory
+    all_have_gpu = all(node.node_profile.system.has_gpu_memory for node in cycle)
+
+    if prefer_gpu and all_have_gpu:
+        return sum(
+            (_get_node_effective_memory(node, prefer_gpu=True) for node in cycle),
+            start=Memory(),
+        )
+    else:
+        return sum(
+            (node.node_profile.memory.ram_available for node in cycle),
+            start=Memory(),
+        )
+
+
 def filter_cycles_by_memory(
-    cycles: list[list[NodeInfo]], required_memory: Memory
+    cycles: list[list[NodeInfo]],
+    required_memory: Memory,
+    prefer_gpu: bool = True,
 ) -> list[list[NodeInfo]]:
+    """
+    Filter cycles by available memory (RAM or VRAM).
+
+    Args:
+        cycles: List of node cycles to filter
+        required_memory: Minimum memory required for the model
+        prefer_gpu: If True, prefer GPU VRAM over RAM when available
+
+    Returns:
+        List of cycles that have sufficient memory
+    """
     filtered_cycles: list[list[NodeInfo]] = []
     for cycle in cycles:
         if not narrow_all_nodes(cycle):
             continue
 
-        total_mem = sum(
+        # Calculate total RAM available
+        total_ram = sum(
             (node.node_profile.memory.ram_available for node in cycle), start=Memory()
         )
-        if total_mem >= required_memory:
+
+        # Calculate total VRAM available (for nodes with GPU)
+        total_vram = Memory()
+        gpu_node_count = 0
+        for node in cycle:
+            if node.node_profile.system.has_gpu_memory:
+                vram_available_mb = node.node_profile.system.gpu_memory_available_mb
+                total_vram = total_vram + Memory.from_mb(vram_available_mb)
+                gpu_node_count += 1
+
+        # Decide which memory pool to use
+        # If prefer_gpu and ALL nodes have GPU memory, use VRAM
+        # Otherwise, fall back to RAM
+        if prefer_gpu and gpu_node_count == len(cycle) and total_vram > Memory():
+            effective_memory = total_vram
+            logger.debug(
+                f"Cycle with {len(cycle)} nodes has {total_vram.in_gb:.1f}GB VRAM available"
+            )
+        else:
+            effective_memory = total_ram
+            if prefer_gpu and gpu_node_count > 0 and gpu_node_count < len(cycle):
+                logger.debug(
+                    f"Mixed GPU/CPU cycle ({gpu_node_count}/{len(cycle)} GPU nodes), using RAM"
+                )
+
+        if effective_memory >= required_memory:
             filtered_cycles.append(cast(list[NodeInfo], cycle))
+
     return filtered_cycles
 
 
@@ -52,11 +141,9 @@ def get_smallest_cycles(cycles: list[list[NodeInfo]]) -> list[list[NodeInfo]]:
 def get_shard_assignments_for_pipeline_parallel(
     model_meta: ModelMetadata,
     selected_cycle: list[NodeWithProfile],
+    prefer_gpu: bool = True,
 ):
-    cycle_memory = sum(
-        (node.node_profile.memory.ram_available for node in selected_cycle),
-        start=Memory(),
-    )
+    cycle_memory = _get_cycle_effective_memory(selected_cycle, prefer_gpu=prefer_gpu)
     total_layers = model_meta.n_layers
     world_size = len(selected_cycle)
     runner_to_shard: dict[RunnerId, ShardMetadata] = {}
@@ -67,12 +154,9 @@ def get_shard_assignments_for_pipeline_parallel(
         if i == len(selected_cycle) - 1:
             node_layers = total_layers - layers_assigned
         else:
+            node_memory = _get_node_effective_memory(node, prefer_gpu=prefer_gpu)
             node_layers = round(
-                total_layers
-                * (
-                    node.node_profile.memory.ram_available.in_bytes
-                    / cycle_memory.in_bytes
-                )
+                total_layers * (node_memory.in_bytes / cycle_memory.in_bytes)
             )
             node_layers = max(1, node_layers)
 
@@ -137,6 +221,7 @@ def get_shard_assignments(
     model_meta: ModelMetadata,
     selected_cycle: list[NodeInfo],
     sharding: Sharding,
+    prefer_gpu: bool = True,
 ) -> ShardAssignments:
     if not narrow_all_nodes(selected_cycle):
         raise ValueError("All nodes must have profiles to create shard assignments")
@@ -145,6 +230,7 @@ def get_shard_assignments(
             return get_shard_assignments_for_pipeline_parallel(
                 model_meta=model_meta,
                 selected_cycle=selected_cycle,
+                prefer_gpu=prefer_gpu,
             )
         case Sharding.Tensor:
             return get_shard_assignments_for_tensor_parallel(

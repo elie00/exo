@@ -181,6 +181,7 @@ class API:
             sharding=payload.sharding,
             instance_meta=payload.instance_meta,
             min_nodes=payload.min_nodes,
+            prefer_gpu=payload.prefer_gpu,
         )
         await self._send(command)
 
@@ -221,6 +222,7 @@ class API:
         sharding: Sharding = Sharding.Pipeline,
         instance_meta: InstanceMeta = InstanceMeta.MlxRing,
         min_nodes: int = 1,
+        prefer_gpu: bool = True,
     ) -> Instance:
         model_meta = await resolve_model_meta(model_id)
 
@@ -231,6 +233,7 @@ class API:
                     sharding=sharding,
                     instance_meta=instance_meta,
                     min_nodes=min_nodes,
+                    prefer_gpu=prefer_gpu,
                 ),
                 topology=self.state.topology,
                 current_instances=self.state.instances,
@@ -251,7 +254,7 @@ class API:
         return placements[new_ids[0]]
 
     async def get_placement_previews(
-        self, model_id: ModelId
+        self, model_id: ModelId, prefer_gpu: bool = True
     ) -> PlacementPreviewResponse:
         seen: set[tuple[ModelId, Sharding, InstanceMeta, int]] = set()
         previews: list[PlacementPreview] = []
@@ -286,6 +289,7 @@ class API:
                             sharding=sharding,
                             instance_meta=instance_meta,
                             min_nodes=min_nodes,
+                            prefer_gpu=prefer_gpu,
                         ),
                         topology=self.state.topology,
                         current_instances=self.state.instances,

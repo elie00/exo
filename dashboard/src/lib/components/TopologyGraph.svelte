@@ -431,6 +431,7 @@ function wrapLine(text: string, maxLen: number): string[] {
 		nodesWithPositions.forEach(nodeInfo => {
 			const node = nodeInfo.data;
 			const macmon = node.macmon_info;
+			const nvidiaInfo = node.nvidia_info;
 			const modelId = node.system_info?.model_id || 'Unknown';
 			const friendlyName = node.friendly_name || modelId;
 
@@ -440,6 +441,20 @@ function wrapLine(text: string, maxLen: number): string[] {
 			let ramUsed = 0;
 			let gpuUsagePercent = 0;
 			let sysPower: number | null = null;
+			
+			// NVIDIA VRAM info
+			let vramTotal = 0;
+			let vramUsed = 0;
+			let vramUsagePercent = 0;
+			let hasNvidiaGpu = false;
+			
+			// Check for NVIDIA GPU info first
+			if (nvidiaInfo && nvidiaInfo.gpu_memory_total_mb > 0) {
+				hasNvidiaGpu = true;
+				vramTotal = nvidiaInfo.gpu_memory_total_mb * 1024 * 1024; // Convert MB to bytes for formatBytes
+				vramUsed = nvidiaInfo.gpu_memory_used_mb * 1024 * 1024;
+				vramUsagePercent = (nvidiaInfo.gpu_memory_used_mb / nvidiaInfo.gpu_memory_total_mb) * 100;
+			}
 
 			if (macmon) {
 				if (macmon.memory && macmon.memory.ram_total > 0) {
@@ -462,9 +477,29 @@ function wrapLine(text: string, maxLen: number): string[] {
 				.attr('class', 'graph-node')
 				.style('cursor', 'pointer');
 
+			// Build tooltip text with GPU info
+			let tooltipLines = [
+				friendlyName,
+				`ID: ${nodeInfo.id.slice(-8)}`,
+				`RAM: ${formatBytes(ramUsed)}/${formatBytes(ramTotal)}`
+			];
+			
+			if (hasNvidiaGpu && nvidiaInfo) {
+				tooltipLines.push(`VRAM: ${formatBytes(vramUsed)}/${formatBytes(vramTotal)}`);
+				tooltipLines.push(`GPU: NVIDIA (${nvidiaInfo.gpu_count} GPU${nvidiaInfo.gpu_count > 1 ? 's' : ''})`);
+				if (nvidiaInfo.driver_version) {
+					tooltipLines.push(`Driver: ${nvidiaInfo.driver_version}`);
+				}
+				if (nvidiaInfo.cuda_version) {
+					tooltipLines.push(`CUDA: ${nvidiaInfo.cuda_version}`);
+				}
+			} else if (macmon?.gpu_usage) {
+				tooltipLines.push(`GPU: Metal (Apple Silicon)`);
+			}
+
 			// Add tooltip
 			nodeG.append('title')
-				.text(`${friendlyName}\nID: ${nodeInfo.id.slice(-8)}\nMemory: ${formatBytes(ramUsed)}/${formatBytes(ramTotal)}`);
+				.text(tooltipLines.join('\n'));
 
 			let iconBaseWidth = nodeRadius * 1.2;
 			let iconBaseHeight = nodeRadius * 1.0;
@@ -820,6 +855,104 @@ function wrapLine(text: string, maxLen: number): string[] {
 					.text(powerText);
 			}
 
+			// --- Vertical VRAM Bar for NVIDIA GPUs (left side of icon) ---
+			// Only show for nodes with NVIDIA GPU info
+			if (hasNvidiaGpu && (showFullLabels || isMinimized)) {
+				const vramBarWidth = isMinimized ? Math.max(16, nodeRadius * 0.32) : Math.max(28, nodeRadius * 0.30);
+				const vramBarHeight = iconBaseHeight * 0.95;
+				const barXOffset = iconBaseWidth / 2 + (isMinimized ? 5 : 10);
+				const vramBarX = nodeInfo.x - barXOffset - vramBarWidth;
+				const vramBarY = nodeInfo.y - vramBarHeight / 2;
+
+				// VRAM Bar Background (green-tinted grey, no border)
+				nodeG.append('rect')
+					.attr('x', vramBarX)
+					.attr('y', vramBarY)
+					.attr('width', vramBarWidth)
+					.attr('height', vramBarHeight)
+					.attr('fill', 'rgba(60, 80, 70, 0.7)')
+					.attr('rx', 2);
+
+				// VRAM Bar Fill (from bottom up, green color for NVIDIA)
+				if (vramUsagePercent > 0) {
+					const fillHeight = (vramUsagePercent / 100) * vramBarHeight;
+					nodeG.append('rect')
+						.attr('x', vramBarX)
+						.attr('y', vramBarY + (vramBarHeight - fillHeight))
+						.attr('width', vramBarWidth)
+						.attr('height', fillHeight)
+						.attr('fill', 'rgba(118, 185, 0, 0.9)')  // NVIDIA green
+						.attr('opacity', 0.9)
+						.attr('rx', 2);
+				}
+
+				// VRAM Stats Text (centered on bar, multiline)
+				const vramTextX = vramBarX + vramBarWidth / 2;
+				const vramTextY = vramBarY + vramBarHeight / 2;
+				const vramTextFontSize = isMinimized ? Math.max(8, vramBarWidth * 0.5) : Math.min(14, Math.max(10, vramBarWidth * 0.45));
+				const vramLineSpacing = vramTextFontSize * 1.25;
+
+				// "VRAM" label
+				nodeG.append('text')
+					.attr('x', vramTextX)
+					.attr('y', vramTextY - vramLineSpacing)
+					.attr('text-anchor', 'middle')
+					.attr('dominant-baseline', 'middle')
+					.attr('fill', 'rgba(255,255,255,0.7)')
+					.attr('font-size', vramTextFontSize * 0.7)
+					.attr('font-weight', '500')
+					.attr('font-family', 'SF Mono, Monaco, monospace')
+					.text('VRAM');
+
+				// VRAM Usage %
+				const vramUsageText = `${vramUsagePercent.toFixed(0)}%`;
+				nodeG.append('text')
+					.attr('x', vramTextX)
+					.attr('y', vramTextY)
+					.attr('text-anchor', 'middle')
+					.attr('dominant-baseline', 'middle')
+					.attr('fill', '#FFFFFF')
+					.attr('font-size', vramTextFontSize)
+					.attr('font-weight', '700')
+					.attr('font-family', 'SF Mono, Monaco, monospace')
+					.text(vramUsageText);
+
+				// VRAM Used/Total (compact format)
+				const vramUsedMb = nvidiaInfo!.gpu_memory_used_mb;
+				const vramTotalMb = nvidiaInfo!.gpu_memory_total_mb;
+				const vramCompactText = vramTotalMb >= 1024 
+					? `${(vramUsedMb / 1024).toFixed(0)}/${(vramTotalMb / 1024).toFixed(0)}G`
+					: `${vramUsedMb}/${vramTotalMb}M`;
+				nodeG.append('text')
+					.attr('x', vramTextX)
+					.attr('y', vramTextY + vramLineSpacing)
+					.attr('text-anchor', 'middle')
+					.attr('dominant-baseline', 'middle')
+					.attr('fill', 'rgba(255,255,255,0.8)')
+					.attr('font-size', vramTextFontSize * 0.75)
+					.attr('font-weight', '500')
+					.attr('font-family', 'SF Mono, Monaco, monospace')
+					.text(vramCompactText);
+			}
+
+			// --- GPU Type Badge ---
+			// Determine GPU type: NVIDIA (Linux), Metal (macOS), or CPU-only
+			const modelLowerCheck = modelId.toLowerCase();
+			const isMacDevice = modelLowerCheck.includes('mac') || modelLowerCheck.includes('macbook');
+			let gpuType: 'nvidia' | 'metal' | 'cpu' = 'cpu';
+			let gpuBadgeColor = 'rgba(128, 128, 128, 0.7)';  // Gray for CPU
+			let gpuBadgeText = 'CPU';
+			
+			if (hasNvidiaGpu) {
+				gpuType = 'nvidia';
+				gpuBadgeColor = 'rgba(118, 185, 0, 0.9)';  // NVIDIA green
+				gpuBadgeText = 'GPU';
+			} else if (isMacDevice && macmon?.gpu_usage) {
+				gpuType = 'metal';
+				gpuBadgeColor = 'rgba(100, 160, 255, 0.9)';  // Apple blue
+				gpuBadgeText = 'GPU';
+			}
+
 			// Labels - adapt based on mode
 			if (showFullLabels) {
 				// FULL MODE: Name above, memory info below (1-4 nodes)
@@ -844,6 +977,35 @@ function wrapLine(text: string, maxLen: number): string[] {
 					.attr('font-family', 'SF Mono, Monaco, monospace')
 					.text(displayName);
 
+				// GPU/CPU Badge (small pill next to name)
+				const badgeFontSize = fontSize * 0.7;
+				const badgeY = nameY - fontSize - 4;
+				const badgePadding = 4;
+				const badgeText = gpuType === 'nvidia' ? 'NVIDIA' : (gpuType === 'metal' ? 'Metal' : 'CPU');
+				
+				// Badge background (pill shape)
+				const badgeWidth = badgeText.length * badgeFontSize * 0.6 + badgePadding * 2;
+				const badgeHeight = badgeFontSize + badgePadding;
+				nodeG.append('rect')
+					.attr('x', nodeInfo.x - badgeWidth / 2)
+					.attr('y', badgeY - badgeHeight / 2)
+					.attr('width', badgeWidth)
+					.attr('height', badgeHeight)
+					.attr('rx', badgeHeight / 2)
+					.attr('fill', gpuBadgeColor);
+				
+				// Badge text
+				nodeG.append('text')
+					.attr('x', nodeInfo.x)
+					.attr('y', badgeY)
+					.attr('text-anchor', 'middle')
+					.attr('dominant-baseline', 'middle')
+					.attr('fill', '#FFFFFF')
+					.attr('font-size', badgeFontSize)
+					.attr('font-weight', '600')
+					.attr('font-family', 'SF Mono, Monaco, monospace')
+					.text(badgeText);
+
 				// Memory info below - used in grey, total in yellow
 				const infoY = nodeInfo.y + iconBaseHeight / 2 + 16;
 				const memText = nodeG.append('text')
@@ -861,6 +1023,26 @@ function wrapLine(text: string, maxLen: number): string[] {
 				memText.append('tspan')
 					.attr('fill', 'rgba(179,179,179,0.7)')
 					.text(` (${ramUsagePercent.toFixed(0)}%)`);
+
+				// VRAM info for NVIDIA nodes (second line)
+				if (hasNvidiaGpu && nvidiaInfo) {
+					const vramInfoY = infoY + fontSize * 1.1;
+					const vramText = nodeG.append('text')
+						.attr('x', nodeInfo.x)
+						.attr('y', vramInfoY)
+						.attr('text-anchor', 'middle')
+						.attr('font-size', fontSize * 0.75)
+						.attr('font-family', 'SF Mono, Monaco, monospace');
+					vramText.append('tspan')
+						.attr('fill', 'rgba(118,185,0,0.9)')  // NVIDIA green
+						.text('VRAM ');
+					vramText.append('tspan')
+						.attr('fill', 'rgba(118,185,0,0.9)')
+						.text(`${formatBytes(vramUsed)}`);
+					vramText.append('tspan')
+						.attr('fill', 'rgba(150,150,150,0.8)')
+						.text(`/${formatBytes(vramTotal)}`);
+				}
 
 			} else if (showCompactLabels) {
 				// COMPACT MODE: Just name and basic info (4+ nodes)
@@ -910,6 +1092,17 @@ function wrapLine(text: string, maxLen: number): string[] {
 					.attr('font-family', 'SF Mono, Monaco, monospace')
 					.text(shortName);
 
+				// Small GPU type indicator dot (next to name)
+				if (gpuType !== 'cpu') {
+					const dotRadius = 3;
+					const dotX = nodeInfo.x + (shortName.length * fontSize * 0.3) + dotRadius + 4;
+					nodeG.append('circle')
+						.attr('cx', dotX)
+						.attr('cy', nameY)
+						.attr('r', dotRadius)
+						.attr('fill', gpuBadgeColor);
+				}
+
 				// Memory info below icon - used in grey, total in yellow (same as main topology)
 				const infoY = nodeInfo.y + iconBaseHeight / 2 + 10;
 				const memTextMini = nodeG.append('text')
@@ -927,6 +1120,19 @@ function wrapLine(text: string, maxLen: number): string[] {
 				memTextMini.append('tspan')
 					.attr('fill', 'rgba(179,179,179,0.7)')
 					.text(` (${ramUsagePercent.toFixed(0)}%)`);
+
+				// VRAM info for NVIDIA nodes in minimized mode
+				if (hasNvidiaGpu && nvidiaInfo) {
+					const vramInfoY = infoY + fontSize;
+					nodeG.append('text')
+						.attr('x', nodeInfo.x)
+						.attr('y', vramInfoY)
+						.attr('text-anchor', 'middle')
+						.attr('font-size', fontSize * 0.75)
+						.attr('font-family', 'SF Mono, Monaco, monospace')
+						.attr('fill', 'rgba(118,185,0,0.85)')  // NVIDIA green
+						.text(`VRAM ${vramUsagePercent.toFixed(0)}%`);
+				}
 			}
 		});
 

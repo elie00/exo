@@ -44,6 +44,14 @@ export interface NodeInfo {
 		gpu_usage?: [number, number];
 		sys_power?: number;
 	};
+	// NVIDIA GPU specific fields (populated on Linux with NVIDIA GPUs)
+	nvidia_info?: {
+		gpu_memory_total_mb: number;
+		gpu_memory_used_mb: number;
+		gpu_count: number;
+		driver_version?: string;
+		cuda_version?: string;
+	};
 	last_macmon_update: number;
 	friendly_name?: string;
 }
@@ -91,6 +99,12 @@ interface RawNodeProfile {
 		gpuUsage?: number;
 		temp?: number;
 		sysPower?: number;
+		// NVIDIA GPU specific fields (populated on Linux with NVIDIA GPUs)
+		gpuMemoryTotalMb?: number;
+		gpuMemoryUsedMb?: number;
+		gpuCount?: number;
+		driverVersion?: string;
+		cudaVersion?: string;
 	};
 }
 
@@ -255,6 +269,14 @@ function transformTopology(raw: RawTopology, profiles?: RawNodeProfiles): Topolo
 				gpu_usage: profile?.system?.gpuUsage !== undefined ? [0, profile.system.gpuUsage] : undefined,
 				sys_power: profile?.system?.sysPower
 			},
+			// NVIDIA GPU info (populated on Linux with NVIDIA GPUs)
+			nvidia_info: profile?.system?.gpuMemoryTotalMb !== undefined && profile.system.gpuMemoryTotalMb > 0 ? {
+				gpu_memory_total_mb: profile.system.gpuMemoryTotalMb,
+				gpu_memory_used_mb: profile.system.gpuMemoryUsedMb ?? 0,
+				gpu_count: profile.system.gpuCount ?? 1,
+				driver_version: profile.system.driverVersion,
+				cuda_version: profile.system.cudaVersion
+			} : undefined,
 			last_macmon_update: Date.now() / 1000,
 			friendly_name: profile?.friendlyName
 		};

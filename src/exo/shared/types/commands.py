@@ -25,6 +25,7 @@ class PlaceInstance(BaseCommand):
     sharding: Sharding
     instance_meta: InstanceMeta
     min_nodes: int
+    prefer_gpu: bool = True  # Prefer GPU VRAM over RAM when available
 
 
 class CreateInstance(BaseCommand):

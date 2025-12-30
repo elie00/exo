@@ -1,9 +1,10 @@
 import json
 import os
+import platform
 import resource
 import time
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
 
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
@@ -52,6 +53,109 @@ from exo.worker.runner.bootstrap import logger
 Group = mx.distributed.Group
 # Needed for 8 bit model
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
+
+
+# --- Device Detection and Configuration ---
+
+MlxDeviceType = Literal["metal", "cuda", "cpu"]
+
+
+def _detect_mlx_device() -> MlxDeviceType:
+    """
+    Detect the best available MLX device.
+
+    Priority:
+    1. Apple Metal (macOS with Apple Silicon)
+    2. NVIDIA CUDA (Linux with NVIDIA GPU and MLX CUDA support)
+    3. CPU fallback
+
+    Returns:
+        The device type string: "metal", "cuda", or "cpu"
+    """
+    system = platform.system().lower()
+
+    # Check for Apple Metal (macOS)
+    if system == "darwin" and mx.metal.is_available():
+        return "metal"
+
+    # Check for NVIDIA CUDA (Linux)
+    if system == "linux":
+        # Check if MLX has CUDA support
+        if hasattr(mx, "cuda") and hasattr(mx.cuda, "is_available"):
+            try:
+                if mx.cuda.is_available():  # type: ignore[attr-defined]
+                    return "cuda"
+            except Exception as e:
+                logger.debug(f"CUDA detection failed: {e}")
+
+    # Fallback to CPU
+    return "cpu"
+
+
+def _configure_mlx_device(device_type: MlxDeviceType) -> None:
+    """
+    Configure MLX to use the specified device.
+
+    Args:
+        device_type: The device type to configure ("metal", "cuda", or "cpu")
+    """
+    match device_type:
+        case "metal":
+            mx.set_default_device(mx.gpu)
+            logger.info("MLX configured to use Apple Metal GPU")
+        case "cuda":
+            # MLX CUDA uses mx.gpu as the device type
+            mx.set_default_device(mx.gpu)
+            logger.info("MLX configured to use NVIDIA CUDA GPU")
+        case "cpu":
+            mx.set_default_device(mx.cpu)
+            logger.info("MLX configured to use CPU (no GPU acceleration)")
+
+
+def get_mlx_device_info() -> dict[str, str | int | bool]:
+    """
+    Get information about the current MLX device configuration.
+
+    Returns:
+        Dictionary with device information including type, name, and memory.
+    """
+    device_type = _detect_mlx_device()
+    info: dict[str, str | int | bool] = {
+        "device_type": device_type,
+        "platform": platform.system(),
+    }
+
+    if device_type == "metal" and mx.metal.is_available():
+        device_info = mx.metal.device_info()
+        info["device_name"] = str(device_info.get("device_name", "Unknown"))
+        info["max_recommended_memory"] = int(
+            device_info.get("max_recommended_working_set_size", 0)
+        )
+        info["metal_available"] = True
+
+    elif device_type == "cuda":
+        info["cuda_available"] = True
+        # Try to get NVIDIA GPU info via pynvml if available
+        try:
+            from exo.worker.utils.nvidia_monitor import get_metrics, is_nvidia_available
+
+            if is_nvidia_available():
+                metrics = get_metrics()
+                info["gpu_count"] = metrics.gpu_count
+                info["driver_version"] = metrics.driver_version
+                info["cuda_version"] = metrics.cuda_version
+                info["gpu_memory_total_mb"] = metrics.gpu_memory_total_mb
+                if metrics.gpus:
+                    info["device_name"] = metrics.gpus[0].name
+        except ImportError:
+            logger.debug("pynvml not available for CUDA device info")
+        except Exception as e:
+            logger.debug(f"Failed to get NVIDIA GPU info: {e}")
+
+    else:
+        info["cpu_only"] = True
+
+    return info
 
 
 # TODO: Test this
@@ -164,6 +268,14 @@ def mlx_distributed_init(
 def initialize_mlx(
     bound_instance: BoundInstance,
 ) -> Group:
+    # Configure MLX device based on available hardware
+    device_type = _detect_mlx_device()
+    _configure_mlx_device(device_type)
+
+    # Log device info at startup
+    device_info = get_mlx_device_info()
+    logger.info(f"MLX device info: {device_info}")
+
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)

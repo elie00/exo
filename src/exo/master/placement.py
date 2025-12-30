@@ -60,7 +60,7 @@ def place_instance(
         filter(lambda it: len(it) >= command.min_nodes, cycles + singleton_cycles)
     )
     cycles_with_sufficient_memory = filter_cycles_by_memory(
-        candidate_cycles, command.model_meta.storage_size
+        candidate_cycles, command.model_meta.storage_size, prefer_gpu=command.prefer_gpu
     )
     if not cycles_with_sufficient_memory:
         raise ValueError("No cycles found with sufficient memory")
@@ -95,7 +95,10 @@ def place_instance(
     )
 
     shard_assignments = get_shard_assignments(
-        command.model_meta, selected_cycle, command.sharding
+        command.model_meta,
+        selected_cycle,
+        command.sharding,
+        prefer_gpu=command.prefer_gpu,
     )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle)

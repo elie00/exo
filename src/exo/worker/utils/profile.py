@@ -1,7 +1,7 @@
 import asyncio
 import os
 import platform
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Union
 
 import anyio
 from loguru import logger
@@ -20,18 +20,41 @@ from .macmon import (
 from .macmon import (
     get_metrics_async as macmon_get_metrics_async,
 )
+from .nvidia_monitor import (
+    NvidiaMetrics,
+    NvidiaMonitorError,
+    is_nvidia_available,
+)
+from .nvidia_monitor import (
+    get_metrics_async as nvidia_get_metrics_async,
+)
 from .system_info import (
     get_friendly_name,
     get_model_and_chip,
     get_network_interfaces,
 )
 
+# Union type for all possible metrics types
+AnyMetrics = Union[Metrics, NvidiaMetrics]
 
-async def get_metrics_async() -> Metrics | None:
-    """Return detailed Metrics on macOS or a minimal fallback elsewhere."""
 
-    if platform.system().lower() == "darwin":
+async def get_metrics_async() -> AnyMetrics | None:
+    """Return detailed Metrics on macOS or NVIDIA metrics on Linux, or None if unavailable."""
+    system = platform.system().lower()
+
+    if system == "darwin":
         return await macmon_get_metrics_async()
+    elif system == "linux":
+        # Try NVIDIA GPU monitoring on Linux
+        if is_nvidia_available():
+            try:
+                return await nvidia_get_metrics_async()
+            except NvidiaMonitorError as e:
+                logger.debug(f"NVIDIA monitoring failed: {e}")
+                return None
+        return None
+    else:
+        return None
 
 
 def get_memory_profile() -> MemoryPerformanceProfile:
@@ -67,6 +90,36 @@ async def start_polling_memory_metrics(
             await anyio.sleep(poll_interval_s)
 
 
+def _build_system_profile(metrics: AnyMetrics) -> SystemPerformanceProfile:
+    """Build a SystemPerformanceProfile from either macOS or NVIDIA metrics."""
+    if isinstance(metrics, NvidiaMetrics):
+        # NVIDIA GPU metrics (Linux)
+        return SystemPerformanceProfile(
+            gpu_usage=metrics.gpu_usage,
+            temp=metrics.gpu_temp,
+            sys_power=metrics.gpu_power,
+            pcpu_usage=0.0,  # Not available from NVML
+            ecpu_usage=0.0,  # Not applicable (Apple-specific)
+            ane_power=0.0,  # Not applicable (Apple-specific)
+            # Extended NVIDIA fields
+            gpu_memory_total_mb=metrics.gpu_memory_total_mb,
+            gpu_memory_used_mb=metrics.gpu_memory_used_mb,
+            gpu_count=metrics.gpu_count,
+            driver_version=metrics.driver_version,
+            cuda_version=metrics.cuda_version,
+        )
+    else:
+        # macOS/macmon metrics
+        return SystemPerformanceProfile(
+            gpu_usage=metrics.gpu_usage[1],
+            temp=metrics.temp.gpu_temp_avg,
+            sys_power=metrics.sys_power,
+            pcpu_usage=metrics.pcpu_usage[1],
+            ecpu_usage=metrics.ecpu_usage[1],
+            ane_power=metrics.ane_power,
+        )
+
+
 async def start_polling_node_metrics(
     callback: Callable[[NodePerformanceProfile], Coroutine[Any, Any, None]],
 ):
@@ -85,6 +138,8 @@ async def start_polling_node_metrics(
             # do the memory profile last to get a fresh reading to not conflict with the other memory profiling loop
             memory_profile = get_memory_profile()
 
+            system_profile = _build_system_profile(metrics)
+
             await callback(
                 NodePerformanceProfile(
                     model_id=model_id,
@@ -92,14 +147,7 @@ async def start_polling_node_metrics(
                     friendly_name=friendly_name,
                     network_interfaces=network_interfaces,
                     memory=memory_profile,
-                    system=SystemPerformanceProfile(
-                        gpu_usage=metrics.gpu_usage[1],
-                        temp=metrics.temp.gpu_temp_avg,
-                        sys_power=metrics.sys_power,
-                        pcpu_usage=metrics.pcpu_usage[1],
-                        ecpu_usage=metrics.ecpu_usage[1],
-                        ane_power=metrics.ane_power,
-                    ),
+                    system=system_profile,
                 )
             )
 
@@ -107,7 +155,7 @@ async def start_polling_node_metrics(
             logger.warning(
                 "[resource_monitor] Operation timed out after 30s, skipping this cycle."
             )
-        except MacMonError as e:
+        except (MacMonError, NvidiaMonitorError) as e:
             logger.opt(exception=e).error("Resource Monitor encountered error")
             return
         finally:

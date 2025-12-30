@@ -140,6 +140,7 @@ class PlaceInstanceParams(BaseModel):
     sharding: Sharding = Sharding.Pipeline
     instance_meta: InstanceMeta = InstanceMeta.MlxRing
     min_nodes: int = 1
+    prefer_gpu: bool = True  # Prefer GPU VRAM over RAM when available for placement
 
     @field_validator("sharding", "instance_meta", mode="plain")
     @classmethod

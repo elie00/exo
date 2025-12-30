@@ -46,6 +46,25 @@ class SystemPerformanceProfile(CamelCaseModel):
     ecpu_usage: float = 0.0
     ane_power: float = 0.0
 
+    # NVIDIA GPU specific fields (populated on Linux with NVIDIA GPUs)
+    gpu_memory_total_mb: int | None = None
+    gpu_memory_used_mb: int | None = None
+    gpu_count: int | None = None
+    driver_version: str | None = None
+    cuda_version: str | None = None
+
+    @property
+    def gpu_memory_available_mb(self) -> int:
+        """Calculate available GPU memory in MB."""
+        if self.gpu_memory_total_mb is None or self.gpu_memory_used_mb is None:
+            return 0
+        return max(0, self.gpu_memory_total_mb - self.gpu_memory_used_mb)
+
+    @property
+    def has_gpu_memory(self) -> bool:
+        """Check if GPU memory information is available."""
+        return self.gpu_memory_total_mb is not None and self.gpu_memory_total_mb > 0
+
 
 class NetworkInterfaceInfo(CamelCaseModel):
     name: str
