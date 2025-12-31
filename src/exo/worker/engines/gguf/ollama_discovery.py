@@ -6,6 +6,7 @@ and extracts their metadata for use in EXO's distributed inference system.
 
 import json
 import os
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -40,10 +41,36 @@ class OllamaModel:
 def get_ollama_home() -> Path:
     """Get the Ollama home directory.
     
+    Searches multiple locations based on OS and environment variables.
+    
     Returns:
-        Path to Ollama's home directory (default: ~/.ollama)
+        Path to Ollama's home directory
     """
-    return Path(os.environ.get("OLLAMA_HOME", Path.home() / ".ollama"))
+    # Check environment variables first
+    if "OLLAMA_HOME" in os.environ:
+        return Path(os.environ["OLLAMA_HOME"])
+    
+    if "OLLAMA_MODELS" in os.environ:
+        # OLLAMA_MODELS points to the models dir, parent is home
+        return Path(os.environ["OLLAMA_MODELS"]).parent
+    
+    # OS-specific defaults
+    if platform.system() == "Darwin":
+        return Path.home() / ".ollama"
+    elif platform.system() == "Linux":
+        # Try user directory first
+        user_path = Path.home() / ".ollama"
+        if user_path.exists():
+            return user_path
+        # System installation (via official install script)
+        system_path = Path("/usr/share/ollama/.ollama")
+        if system_path.exists():
+            return system_path
+        # Fallback to user path (will be created if models are pulled)
+        return user_path
+    else:
+        # Windows or other
+        return Path.home() / ".ollama"
 
 
 def get_ollama_models_dir() -> Path:
@@ -52,7 +79,39 @@ def get_ollama_models_dir() -> Path:
     Returns:
         Path to Ollama's models directory
     """
+    # Check if OLLAMA_MODELS is explicitly set
+    if "OLLAMA_MODELS" in os.environ:
+        return Path(os.environ["OLLAMA_MODELS"])
+    
     return get_ollama_home() / "models"
+
+
+def _find_models_dir() -> Optional[Path]:
+    """Find the Ollama models directory by searching multiple locations.
+    
+    Returns:
+        Path to models directory if found, None otherwise
+    """
+    # Check environment variable first
+    if "OLLAMA_MODELS" in os.environ:
+        path = Path(os.environ["OLLAMA_MODELS"])
+        if path.exists():
+            return path
+    
+    # List of possible locations to check
+    candidates = [
+        Path.home() / ".ollama" / "models",
+        Path("/usr/share/ollama/.ollama/models"),
+        Path("/var/lib/ollama/models"),
+        Path("/opt/ollama/models"),
+    ]
+    
+    for candidate in candidates:
+        if candidate.exists():
+            logger.debug(f"Found Ollama models at: {candidate}")
+            return candidate
+    
+    return None
 
 
 def get_ollama_model_path(model_name: str, tag: str = "latest") -> Optional[Path]:
@@ -65,7 +124,11 @@ def get_ollama_model_path(model_name: str, tag: str = "latest") -> Optional[Path
     Returns:
         Path to the model's GGUF file, or None if not found
     """
-    models_dir = get_ollama_models_dir()
+    models_dir = _find_models_dir()
+    if models_dir is None:
+        logger.warning("No Ollama models directory found")
+        return None
+    
     manifests_dir = models_dir / "manifests" / "registry.ollama.ai" / "library"
     
     manifest_path = manifests_dir / model_name / tag
@@ -105,16 +168,20 @@ def discover_ollama_models() -> list[OllamaModel]:
         List of OllamaModel objects representing installed models
     """
     models: list[OllamaModel] = []
-    models_dir = get_ollama_models_dir()
     
-    if not models_dir.exists():
-        logger.info("Ollama models directory not found")
+    # Find models directory
+    models_dir = _find_models_dir()
+    if models_dir is None:
+        logger.info("Ollama models directory not found in any standard location")
+        logger.info("Searched: ~/.ollama/models, /usr/share/ollama/.ollama/models")
         return models
+    
+    logger.debug(f"Using Ollama models directory: {models_dir}")
     
     manifests_dir = models_dir / "manifests" / "registry.ollama.ai" / "library"
     
     if not manifests_dir.exists():
-        logger.info("Ollama manifests directory not found")
+        logger.info(f"Ollama manifests directory not found at {manifests_dir}")
         return models
     
     blobs_dir = models_dir / "blobs"

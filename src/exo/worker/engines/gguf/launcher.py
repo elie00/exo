@@ -54,7 +54,22 @@ def parse_node_addresses(nodes_str: str) -> list[tuple[str, int]]:
 
 
 def get_model_path(model_name: str) -> Optional[Path]:
-    """Get path to Ollama model by name."""
+    """Get path to Ollama model by name or direct path.
+    
+    Args:
+        model_name: Either an Ollama model name (e.g., 'qwen3-coder:30b')
+                   or a direct path to a GGUF file
+    
+    Returns:
+        Path to the GGUF file, or None if not found
+    """
+    # Check if it's a direct path to a file
+    direct_path = Path(model_name)
+    if direct_path.exists() and direct_path.is_file():
+        logger.info(f"Using direct GGUF path: {direct_path}")
+        return direct_path
+    
+    # Try Ollama model discovery
     if ":" in model_name:
         name, tag = model_name.split(":", 1)
     else:
@@ -64,6 +79,32 @@ def get_model_path(model_name: str) -> Optional[Path]:
     for model in models:
         if model.name == name and model.tag == tag:
             return model.model_path
+    
+    # If we still haven't found it, try some common direct paths
+    # This helps when running on systems with non-standard Ollama installations
+    fallback_paths = [
+        Path(f"/usr/share/ollama/.ollama/models/blobs"),
+        Path.home() / ".ollama" / "models" / "blobs",
+    ]
+    
+    for blobs_dir in fallback_paths:
+        if blobs_dir.exists():
+            # Look for the model by scanning manifest files
+            manifests_base = blobs_dir.parent / "manifests" / "registry.ollama.ai" / "library" / name / tag
+            if manifests_base.exists():
+                try:
+                    import json
+                    with open(manifests_base) as f:
+                        manifest = json.load(f)
+                    for layer in manifest.get("layers", []):
+                        if "model" in layer.get("mediaType", ""):
+                            digest = layer.get("digest", "").replace(":", "-")
+                            blob_path = blobs_dir / digest
+                            if blob_path.exists():
+                                logger.info(f"Found model via fallback: {blob_path}")
+                                return blob_path
+                except Exception as e:
+                    logger.debug(f"Fallback search failed: {e}")
     
     return None
 

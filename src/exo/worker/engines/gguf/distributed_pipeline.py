@@ -172,7 +172,7 @@ class TCPActivationTransport(ActivationTransport):
     
     async def _connect_to_next_node(self) -> None:
         """Establish connection to the next node in the pipeline."""
-        max_retries = 30
+        max_retries = 300  # 5 minutes timeout
         retry_delay = 1.0
         
         for attempt in range(max_retries):
