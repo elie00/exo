@@ -14,6 +14,7 @@ class InstanceId(Id):
 class InstanceMeta(str, Enum):
     MlxRing = "MlxRing"
     MlxJaccl = "MlxJaccl"
+    GGUFPipeline = "GGUFPipeline"  # For Ollama/GGUF models
 
 
 class BaseInstance(TaggedModel):
@@ -34,8 +35,19 @@ class MlxJacclInstance(BaseInstance):
     jaccl_coordinators: dict[NodeId, str]
 
 
+class GGUFPipelineInstance(BaseInstance):
+    """Instance for distributed GGUF/Ollama model inference.
+    
+    Uses pipeline parallelism where each node handles a subset of layers
+    and activations are passed between nodes via TCP.
+    """
+    gguf_model_path: str  # Path to GGUF file (on each node)
+    pipeline_ports: dict[NodeId, int]  # Port each node listens on for activations
+    node_order: list[NodeId]  # Order of nodes in the pipeline
+
+
 # TODO: Single node instance
-Instance = MlxRingInstance | MlxJacclInstance
+Instance = MlxRingInstance | MlxJacclInstance | GGUFPipelineInstance
 
 
 class BoundInstance(CamelCaseModel):

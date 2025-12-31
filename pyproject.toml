@@ -58,6 +58,10 @@ dev = [
 cuda = [
     "mlx[cuda]>=0.30.1",
 ]
+# GGUF/Ollama model support for distributed inference
+ollama = [
+    "llama-cpp-python>=0.3.0", # GGUF inference with llama.cpp
+]
 
 ###
 # workspace configuration
