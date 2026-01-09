@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { TopologyGraph, ChatForm, ChatMessages, ChatSidebar, ModelCard } from '$lib/components';
+	import { TopologyGraph, ChatForm, ChatMessages, ChatSidebar, ModelCard, OllamaPanel } from '$lib/components';
 	import { 
 		hasStartedChat, 
 		isTopologyMinimized, 
@@ -1199,6 +1199,11 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 				
 				<!-- Right Sidebar: Instance Controls (wider on welcome page for better visibility) -->
 				<aside class="w-80 border-l border-exo-yellow/10 bg-exo-dark-gray flex flex-col flex-shrink-0">
+					<!-- Ollama Cluster Panel -->
+					<div class="p-4 flex-shrink-0 border-b border-exo-yellow/10">
+						<OllamaPanel />
+					</div>
+					
 					<!-- Running Instances Panel (only shown when instances exist) - Scrollable -->
 					{#if instanceCount > 0}
 					<div class="p-4 flex-shrink-0">

@@ -64,6 +64,13 @@ from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.dashboard_path import find_dashboard
 from exo.utils.event_buffer import OrderedBuffer
 
+# GGUF Integration imports
+from exo.worker.engines.gguf.exo_integration import get_ollama_model_cards
+from exo.worker.engines.gguf.launcher import run_distributed_node, parse_node_addresses
+import subprocess
+import asyncio
+
+
 encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
 
@@ -88,8 +95,21 @@ async def resolve_model_meta(model_id: str) -> ModelMetadata:
     if model_id in MODEL_CARDS:
         model_card = MODEL_CARDS[model_id]
         return model_card.metadata
-    else:
-        return await get_model_meta(model_id)
+    
+    # Check if it's an Ollama model
+    if model_id.startswith("ollama-") or "ollama" in model_id:
+        try:
+            cards = get_ollama_model_cards()
+            if model_id in cards:
+                return cards[model_id].metadata
+            # Try to find by partial match if needed
+            for card in cards.values():
+                if str(card.model_id) == model_id:
+                    return card.metadata
+        except Exception as e:
+            logger.error(f"Error resolving Ollama metadata: {e}")
+
+    return await get_model_meta(model_id)
 
 
 class API:
@@ -134,6 +154,10 @@ class API:
 
         self._chat_completion_queues: dict[CommandId, Sender[TokenChunk]] = {}
         self._tg: TaskGroup | None = None
+        
+        # Ollama cluster nodes: [(host, port), ...]
+        # Always includes localhost:11434 as the first node
+        self._ollama_nodes: list[tuple[str, int]] = [("localhost", 11434)]
 
     def reset(self, new_session_id: SessionId, result_clock: int):
         logger.info("Resetting API State")
@@ -174,6 +198,13 @@ class API:
         )
         self.app.get("/state")(lambda: self.state)
         self.app.get("/events")(lambda: self._event_log)
+        
+        # Ollama cluster management routes
+        self.app.get("/ollama/nodes")(self.get_ollama_nodes)
+        self.app.post("/ollama/nodes")(self.add_ollama_node)
+        self.app.delete("/ollama/nodes/{host}")(self.remove_ollama_node)
+        self.app.post("/ollama/generate")(self.generate_ollama)
+
 
     async def place_instance(self, payload: PlaceInstanceParams):
         command = PlaceInstance(
@@ -499,10 +530,226 @@ class API:
             "TODO: we should send a notification to the user to download the model"
         )
 
+    async def _run_ollama_inference(self, payload: ChatCompletionTaskParams) -> AsyncGenerator[str, None]:
+        """Run inference using GGUF/Ollama backend."""
+        # Detect model path
+        ollama_cards = get_ollama_model_cards()
+        target_card = None
+        for card in ollama_cards.values():
+            if card.short_id == payload.model or str(card.model_id) == payload.model:
+                target_card = card
+                break
+        
+        if not target_card:
+            yield f"data: {{\"error\": \"Model {payload.model} not found\"}}\n\n"
+            return
+            
+        model_path = target_card.gguf_path
+        logger.info(f"Running GGUF inference on {model_path}")
+
+        # Construct basic local GGUF pipeline for now (single node or auto-detect)
+        # For simplicity in this integration, we run a subprocess that prints tokens
+        # Ideally we would use the DistributedGGUFPipeline class directly if async loop permits
+        
+        # We'll use a wrapper around llama-cpp-python here for immediate feedback
+        # This is a temporary "local" execution mode to satisfy the frontend integration
+        from llama_cpp import Llama
+        
+        # Run in executor to avoid blocking main loop
+        def run_inference_sync():
+            try:
+                llm = Llama(
+                    model_path=str(model_path),
+                    n_ctx=2048,
+                    n_gpu_layers=-1, # Try to use GPU
+                    verbose=False
+                )
+                
+                messages = [{"role": "user", "content": payload.messages[-1].content}] # Simplified
+                if payload.messages:
+                    if payload.messages[-1].role == "user":
+                         prompt = payload.messages[-1].content
+                    else:
+                         prompt = "Hello"
+                
+                stream = llm(
+                    prompt,
+                    max_tokens=payload.max_tokens or 256,
+                    stop=["User:", "\n\n"],
+                    stream=True
+                )
+                
+                for output in stream:
+                    text = output['choices'][0]['text']
+                    yield text
+            except Exception as e:
+                logger.error(f"GGUF Inference error: {e}")
+                return
+
+        # Bridge the sync generator to async
+        queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+        
+        def producer():
+            try:
+                for token in run_inference_sync():
+                     asyncio.run_coroutine_threadsafe(queue.put(token), loop)
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop) # Sentinel
+            except Exception as e:
+                logger.error(f"Producer error: {e}")
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+
+        import threading
+        t = threading.Thread(target=producer)
+        t.start()
+        
+        import time
+        created = int(time.time())
+        
+        while True:
+            token = await queue.get()
+            if token is None:
+                break
+                
+            # Yield in OpenAI format
+            chunk_resp = ChatCompletionResponse(
+                id="gguf-stream",
+                created=created,
+                model=payload.model,
+                choices=[
+                    StreamingChoiceResponse(
+                        index=0,
+                        delta=ChatCompletionMessage(role="assistant", content=token),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+            
+        # Final done
+        yield "data: [DONE]\n\n"
+
+
+
     async def chat_completions(
         self, payload: ChatCompletionTaskParams
     ) -> ChatCompletionResponse | StreamingResponse:
         """Handle chat completions, supporting both streaming and non-streaming responses."""
+        
+        # Check if this is an Ollama model - route directly without instance
+        if payload.model.startswith("ollama-") or "ollama/" in payload.model:
+            logger.info(f"Routing to Ollama cluster for model: {payload.model}")
+            
+            # Convert model ID to Ollama format (e.g., "ollama-qwen3-coder-30b" -> "qwen3-coder:30b")
+            ollama_model = payload.model
+            if ollama_model.startswith("ollama-"):
+                ollama_model = ollama_model[7:]  # Remove "ollama-" prefix
+            if ollama_model.startswith("ollama/"):
+                ollama_model = ollama_model[7:]  # Remove "ollama/" prefix
+            # Convert hyphens back to colons for size suffix (e.g., "qwen3-coder-30b" -> "qwen3-coder:30b")
+            parts = ollama_model.rsplit("-", 1)
+            if len(parts) == 2 and parts[1].endswith("b"):
+                ollama_model = f"{parts[0]}:{parts[1]}"
+            
+            # Build prompt from messages
+            prompt = ""
+            for msg in payload.messages:
+                if msg.role == "user":
+                    prompt = msg.content  # Use last user message
+            
+            if payload.stream:
+                async def ollama_stream():
+                    import aiohttp
+                    # Try each configured Ollama node
+                    for host, port in self._ollama_nodes:
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.post(
+                                    f"http://{host}:{port}/api/generate",
+                                    json={
+                                        "model": ollama_model,
+                                        "prompt": prompt,
+                                        "stream": True,
+                                        "options": {"num_predict": payload.max_tokens or 1024}
+                                    },
+                                    timeout=aiohttp.ClientTimeout(total=300)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        async for line in resp.content:
+                                            if line:
+                                                try:
+                                                    import json
+                                                    data = json.loads(line)
+                                                    token = data.get("response", "")
+                                                    if token:
+                                                        chunk = ChatCompletionResponse(
+                                                            id="ollama-chat",
+                                                            created=int(time.time()),
+                                                            model=payload.model,
+                                                            choices=[
+                                                                StreamingChoiceResponse(
+                                                                    index=0,
+                                                                    delta=ChatCompletionMessage(role="assistant", content=token),
+                                                                    finish_reason=None if not data.get("done") else FinishReason.Stop,
+                                                                )
+                                                            ],
+                                                        )
+                                                        yield f"data: {chunk.model_dump_json()}\n\n"
+                                                    if data.get("done"):
+                                                        yield "data: [DONE]\n\n"
+                                                        return
+                                                except Exception:
+                                                    continue
+                                        return
+                        except Exception as e:
+                            logger.debug(f"Failed to connect to {host}:{port}: {e}")
+                            continue
+                    yield 'data: {"error": "No Ollama node available"}\n\n'
+                    yield "data: [DONE]\n\n"
+                
+                return StreamingResponse(
+                    ollama_stream(),
+                    media_type="text/event-stream",
+                )
+            else:
+                # Non-streaming
+                import aiohttp
+                for host, port in self._ollama_nodes:
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(
+                                f"http://{host}:{port}/api/generate",
+                                json={
+                                    "model": ollama_model,
+                                    "prompt": prompt,
+                                    "stream": False,
+                                    "options": {"num_predict": payload.max_tokens or 1024}
+                                },
+                                timeout=aiohttp.ClientTimeout(total=300)
+                            ) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    return ChatCompletionResponse(
+                                        id="ollama-chat",
+                                        created=int(time.time()),
+                                        model=payload.model,
+                                        choices=[
+                                            ChatCompletionChoice(
+                                                index=0,
+                                                message=ChatCompletionMessage(
+                                                    role="assistant",
+                                                    content=data.get("response", ""),
+                                                ),
+                                                finish_reason=FinishReason.Stop,
+                                            )
+                                        ],
+                                    )
+                    except Exception as e:
+                        logger.debug(f"Failed to connect to {host}:{port}: {e}")
+                        continue
+                raise HTTPException(status_code=503, detail="No Ollama node available")
+        
+        # Regular MLX model path - requires instance
         model_meta = await resolve_model_meta(payload.model)
         payload.model = model_meta.model_id
         parse_gpt_oss = "gpt-oss" in model_meta.model_id.lower()
@@ -553,8 +800,146 @@ class API:
                     supports_tensor=card.metadata.supports_tensor,
                 )
                 for card in MODEL_CARDS.values()
+            ] + [
+                ModelListModel(
+                    id=card.short_id,
+                    hugging_face_id=str(card.model_id),
+                    name=card.name,
+                    description=card.description,
+                    tags=card.tags,
+                    storage_size_megabytes=int(card.metadata.storage_size.in_mb),
+                    supports_tensor=False,
+                )
+                for card in get_ollama_model_cards().values()
             ]
         )
+
+    # ==================== Ollama Cluster Management ====================
+    
+    async def get_ollama_nodes(self):
+        """Get list of configured Ollama nodes with their status."""
+        import aiohttp
+        
+        nodes = []
+        for host, port in self._ollama_nodes:
+            node_info = {
+                "host": host,
+                "port": port,
+                "available": False,
+                "models": [],
+                "model_count": 0,
+            }
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"http://{host}:{port}/api/tags",
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            models = [m["name"] for m in data.get("models", [])]
+                            node_info["available"] = True
+                            node_info["models"] = models
+                            node_info["model_count"] = len(models)
+            except Exception as e:
+                logger.debug(f"Failed to check Ollama node {host}:{port}: {e}")
+            
+            nodes.append(node_info)
+        
+        return {"nodes": nodes}
+    
+    async def add_ollama_node(self, payload: dict):
+        """Add a new Ollama node to the cluster."""
+        host = payload.get("host", "").strip()
+        port = int(payload.get("port", 11434))
+        
+        if not host:
+            raise HTTPException(status_code=400, detail="Host is required")
+        
+        # Check if already exists
+        for h, p in self._ollama_nodes:
+            if h == host and p == port:
+                raise HTTPException(status_code=400, detail=f"Node {host}:{port} already exists")
+        
+        # Verify node is reachable before adding
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"http://{host}:{port}/api/tags",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status != 200:
+                        raise HTTPException(status_code=400, detail=f"Node {host}:{port} is not reachable")
+                    data = await resp.json()
+                    model_count = len(data.get("models", []))
+        except aiohttp.ClientError as e:
+            raise HTTPException(status_code=400, detail=f"Cannot connect to {host}:{port}: {str(e)}")
+        
+        self._ollama_nodes.append((host, port))
+        logger.info(f"Added Ollama node {host}:{port} with {model_count} models")
+        
+        return {"message": f"Node {host}:{port} added successfully", "models": model_count}
+    
+    async def remove_ollama_node(self, host: str):
+        """Remove an Ollama node from the cluster."""
+        # Don't allow removing localhost
+        if host == "localhost" or host == "127.0.0.1":
+            raise HTTPException(status_code=400, detail="Cannot remove local Ollama node")
+        
+        # Find and remove the node
+        for i, (h, p) in enumerate(self._ollama_nodes):
+            if h == host:
+                self._ollama_nodes.pop(i)
+                logger.info(f"Removed Ollama node {host}:{p}")
+                return {"message": f"Node {host} removed successfully"}
+        
+        raise HTTPException(status_code=404, detail=f"Node {host} not found")
+    
+    async def generate_ollama(self, payload: dict):
+        """Generate text using distributed Ollama cluster."""
+        from exo.worker.engines.gguf.ollama_distributed import DistributedOllamaCluster, OllamaNode
+        
+        model = payload.get("model", "")
+        prompt = payload.get("prompt", "")
+        max_tokens = int(payload.get("max_tokens", 256))
+        temperature = float(payload.get("temperature", 0.7))
+        stream = payload.get("stream", False)
+        
+        if not model:
+            raise HTTPException(status_code=400, detail="Model is required")
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Prompt is required")
+        
+        # Create distributed cluster
+        cluster = DistributedOllamaCluster(model_name=model)
+        for host, port in self._ollama_nodes:
+            cluster.add_node(host, port)
+        
+        await cluster.initialize()
+        
+        if stream:
+            async def stream_generator():
+                async for token in cluster.generate(prompt, max_tokens, temperature):
+                    yield f"data: {token}\n\n"
+                yield "data: [DONE]\n\n"
+            
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream"
+            )
+        else:
+            # Collect all tokens
+            tokens = []
+            async for token in cluster.generate(prompt, max_tokens, temperature):
+                tokens.append(token)
+            
+            return {
+                "model": model,
+                "response": "".join(tokens),
+                "nodes_used": len(self._ollama_nodes)
+            }
+
 
     async def run(self):
         cfg = Config()
