@@ -8,7 +8,7 @@ from exo.shared.topology import Topology
 from exo.shared.types.common import Host, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.models import ModelMetadata
-from exo.shared.types.profiling import NodePerformanceProfile
+from exo.shared.types.profiling import GpuDeviceInfo, GpuTopology, NodePerformanceProfile
 from exo.shared.types.topology import NodeInfo
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
 from exo.shared.types.worker.shards import (
@@ -26,6 +26,203 @@ class NodeWithProfile(BaseModel):
 
 def narrow_all_nodes(nodes: list[NodeInfo]) -> TypeGuard[list[NodeWithProfile]]:
     return all(node.node_profile is not None for node in nodes)
+
+
+def get_node_gpu_summary(node: NodeWithProfile) -> str:
+    """
+    Get a human-readable summary of a node's GPU configuration.
+
+    Returns a string like "2x RTX 4090 (48GB total, NVLink)" or "No GPU".
+    """
+    system = node.node_profile.system
+    if not system.has_gpu_memory:
+        return "No GPU"
+
+    gpu_count = system.gpu_count or 1
+    total_gb = (system.gpu_memory_total_mb or 0) / 1024
+
+    # Get GPU names if available
+    gpu_names: list[str] = []
+    if system.gpus:
+        gpu_names = list({gpu.name for gpu in system.gpus})
+
+    # Check topology for NVLink
+    has_nvlink = False
+    if system.gpu_topology is not None:
+        has_nvlink = system.gpu_topology.has_nvlink()
+
+    name_str = gpu_names[0] if len(gpu_names) == 1 else "Mixed GPUs"
+    if gpu_count == 1:
+        return f"{name_str} ({total_gb:.0f}GB)"
+
+    topology_str = "NVLink" if has_nvlink else "PCIe"
+    return f"{gpu_count}x {name_str} ({total_gb:.0f}GB total, {topology_str})"
+
+
+def get_node_per_gpu_memory(node: NodeWithProfile) -> list[tuple[int, Memory]]:
+    """
+    Get per-GPU available memory for a node.
+
+    Returns a list of (gpu_index, available_memory) tuples.
+    Returns empty list if no per-GPU info is available.
+    """
+    system = node.node_profile.system
+    if not system.gpus:
+        return []
+
+    return [
+        (gpu.index, Memory.from_mb(gpu.memory_available_mb))
+        for gpu in system.gpus
+    ]
+
+
+def log_cycle_gpu_summary(cycle: list[NodeWithProfile]) -> None:
+    """Log a summary of GPU configuration for nodes in a cycle."""
+    for node in cycle:
+        summary = get_node_gpu_summary(node)
+        logger.debug(f"  Node {node.node_id}: {summary}")
+
+
+def get_node_topology_score(node: NodeWithProfile) -> float:
+    """
+    Compute a topology quality score for a node's internal GPU configuration.
+
+    Higher scores indicate better GPU interconnects (NVLink > PCIe > system).
+    Score is normalized between 0.0 and 1.0.
+
+    Scoring:
+    - Single GPU: 1.0 (no interconnect needed)
+    - Multi-GPU with all NVLink: 1.0
+    - Multi-GPU with partial NVLink: 0.7
+    - Multi-GPU with PCIe P2P: 0.5
+    - Multi-GPU without P2P: 0.2
+    """
+    system = node.node_profile.system
+    gpu_count = system.gpu_count or 0
+
+    if gpu_count <= 1:
+        return 1.0  # Single GPU or no GPU - no interconnect concerns
+
+    topology = system.gpu_topology
+    if topology is None:
+        return 0.3  # No topology info - assume basic PCIe
+
+    if not topology.links:
+        return 0.3  # No link info
+
+    nvlink_count = sum(1 for link in topology.links if link.link_type == "nvlink")
+    pcie_p2p_count = sum(
+        1 for link in topology.links
+        if link.link_type in ("pcie", "pcie_switch") and link.p2p_supported
+    )
+    total_links = len(topology.links)
+
+    if total_links == 0:
+        return 0.3
+
+    # All links are NVLink
+    if nvlink_count == total_links:
+        return 1.0
+
+    # Some NVLink connections
+    if nvlink_count > 0:
+        return 0.7 + 0.3 * (nvlink_count / total_links)
+
+    # All PCIe with P2P
+    if pcie_p2p_count == total_links:
+        return 0.5
+
+    # Some P2P support
+    if pcie_p2p_count > 0:
+        return 0.3 + 0.2 * (pcie_p2p_count / total_links)
+
+    # No P2P support
+    return 0.2
+
+
+def get_cycle_topology_score(cycle: list[NodeWithProfile]) -> float:
+    """
+    Compute an aggregate topology quality score for a cycle of nodes.
+
+    Returns the minimum topology score among all nodes in the cycle,
+    since the weakest link determines overall performance.
+    """
+    if not cycle:
+        return 0.0
+
+    scores = [get_node_topology_score(node) for node in cycle]
+    return min(scores)
+
+
+def rank_cycles_by_topology(
+    cycles: list[list[NodeInfo]],
+) -> list[tuple[list[NodeInfo], float]]:
+    """
+    Rank cycles by their GPU topology quality.
+
+    Returns a list of (cycle, score) tuples sorted by score descending.
+    Cycles without complete profiles are ranked lowest.
+    """
+    scored_cycles: list[tuple[list[NodeInfo], float]] = []
+
+    for cycle in cycles:
+        if not narrow_all_nodes(cycle):
+            scored_cycles.append((cycle, 0.0))
+            continue
+
+        score = get_cycle_topology_score(cast(list[NodeWithProfile], cycle))
+        scored_cycles.append((cycle, score))
+
+    # Sort by score descending
+    scored_cycles.sort(key=lambda x: x[1], reverse=True)
+    return scored_cycles
+
+
+def select_best_cycle_for_tensor_parallel(
+    cycles: list[list[NodeInfo]],
+    required_memory: Memory,
+) -> list[NodeInfo] | None:
+    """
+    Select the best cycle for tensor parallelism based on topology.
+
+    Tensor parallelism benefits most from high-bandwidth GPU interconnects,
+    so this function prioritizes cycles with NVLink connectivity.
+
+    Args:
+        cycles: List of candidate cycles
+        required_memory: Minimum memory required
+
+    Returns:
+        The best cycle for tensor parallelism, or None if no suitable cycle found.
+    """
+    # Filter to cycles with sufficient memory
+    viable_cycles: list[list[NodeInfo]] = []
+    for cycle in cycles:
+        if not narrow_all_nodes(cycle):
+            continue
+
+        total_vram = Memory()
+        for node in cycle:
+            if node.node_profile.system.has_gpu_memory:
+                total_vram = total_vram + Memory.from_mb(
+                    node.node_profile.system.gpu_memory_available_mb
+                )
+
+        if total_vram >= required_memory:
+            viable_cycles.append(cycle)
+
+    if not viable_cycles:
+        return None
+
+    # Rank by topology quality
+    ranked = rank_cycles_by_topology(viable_cycles)
+
+    if ranked:
+        best_cycle, best_score = ranked[0]
+        logger.info(f"Selected cycle with topology score {best_score:.2f} for tensor parallel")
+        return best_cycle
+
+    return None
 
 
 def _get_node_effective_memory(
@@ -106,19 +303,30 @@ def filter_cycles_by_memory(
         # Calculate total VRAM available (for nodes with GPU)
         total_vram = Memory()
         gpu_node_count = 0
+        total_gpu_devices = 0
+        has_nvlink = False
+
         for node in cycle:
             if node.node_profile.system.has_gpu_memory:
                 vram_available_mb = node.node_profile.system.gpu_memory_available_mb
                 total_vram = total_vram + Memory.from_mb(vram_available_mb)
                 gpu_node_count += 1
+                total_gpu_devices += node.node_profile.system.gpu_count or 1
+
+                # Check for NVLink in multi-GPU nodes
+                if node.node_profile.system.gpu_topology is not None:
+                    if node.node_profile.system.gpu_topology.has_nvlink():
+                        has_nvlink = True
 
         # Decide which memory pool to use
         # If prefer_gpu and ALL nodes have GPU memory, use VRAM
         # Otherwise, fall back to RAM
         if prefer_gpu and gpu_node_count == len(cycle) and total_vram > Memory():
             effective_memory = total_vram
+            nvlink_str = " (NVLink)" if has_nvlink else ""
             logger.debug(
-                f"Cycle with {len(cycle)} nodes has {total_vram.in_gb:.1f}GB VRAM available"
+                f"Cycle: {len(cycle)} nodes, {total_gpu_devices} GPUs, "
+                f"{total_vram.in_gb:.1f}GB VRAM{nvlink_str}"
             )
         else:
             effective_memory = total_ram

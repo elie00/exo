@@ -1,5 +1,6 @@
 import socket
 import sys
+from pathlib import Path
 from subprocess import CalledProcessError
 
 import psutil
@@ -8,24 +9,56 @@ from anyio import run_process
 from exo.shared.types.profiling import NetworkInterfaceInfo
 
 
+def _read_file_safe(path: Path) -> str | None:
+    """Read a file and return its stripped contents, or None on failure."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip() or None
+    except OSError:
+        return None
+
+
+def _get_linux_friendly_name() -> str | None:
+    """
+    Retrieve a human-friendly hostname on Linux.
+
+    Checks /etc/machine-info for PRETTY_HOSTNAME first, then falls back
+    to /etc/hostname.
+    """
+    machine_info = _read_file_safe(Path("/etc/machine-info"))
+    if machine_info:
+        for line in machine_info.splitlines():
+            if line.startswith("PRETTY_HOSTNAME="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    return value
+
+    return _read_file_safe(Path("/etc/hostname"))
+
+
 async def get_friendly_name() -> str:
     """
-    Asynchronously gets the 'Computer Name' (friendly name) of a Mac.
-    e.g., "John's MacBook Pro"
-    Returns the name as a string, or None if an error occurs or not on macOS.
+    Get the friendly name (computer name) of this machine.
+
+    On macOS, uses scutil to retrieve the ComputerName.
+    On Linux, checks /etc/machine-info for PRETTY_HOSTNAME, then /etc/hostname.
+    On Windows, uses socket.gethostname() which returns the NetBIOS name.
+    Falls back to socket.gethostname() on other platforms or errors.
     """
     hostname = socket.gethostname()
 
-    # TODO: better non mac support
-    if sys.platform != "darwin":  # 'darwin' is the platform name for macOS
-        return hostname
+    if sys.platform == "darwin":
+        try:
+            process = await run_process(["scutil", "--get", "ComputerName"])
+        except CalledProcessError:
+            return hostname
+        return process.stdout.decode("utf-8", errors="replace").strip() or hostname
 
-    try:
-        process = await run_process(["scutil", "--get", "ComputerName"])
-    except CalledProcessError:
-        return hostname
+    if sys.platform == "linux":
+        linux_name = _get_linux_friendly_name()
+        return linux_name if linux_name else hostname
 
-    return process.stdout.decode("utf-8", errors="replace").strip() or hostname
+    # Windows and other platforms: socket.gethostname() is sufficient
+    return hostname
 
 
 def get_network_interfaces() -> list[NetworkInterfaceInfo]:
@@ -50,14 +83,100 @@ def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     return interfaces_info
 
 
-async def get_model_and_chip() -> tuple[str, str]:
-    """Get Mac system information using system_profiler."""
-    model = "Unknown Model"
-    chip = "Unknown Chip"
+def _get_linux_model() -> str:
+    """
+    Retrieve the product/model name on Linux via DMI.
 
-    # TODO: better non mac support
-    if sys.platform != "darwin":
+    Falls back to 'Linux Machine' if DMI info is unavailable.
+    """
+    dmi_paths = [
+        Path("/sys/devices/virtual/dmi/id/product_name"),
+        Path("/sys/class/dmi/id/product_name"),
+    ]
+    for path in dmi_paths:
+        value = _read_file_safe(path)
+        if value and value.lower() not in ("", "to be filled by o.e.m.", "system product name"):
+            return value
+    return "Linux Machine"
+
+
+def _get_linux_chip() -> str:
+    """
+    Retrieve CPU model name from /proc/cpuinfo on Linux.
+
+    Falls back to 'Unknown CPU' if parsing fails.
+    """
+    cpuinfo = _read_file_safe(Path("/proc/cpuinfo"))
+    if cpuinfo:
+        for line in cpuinfo.splitlines():
+            if line.startswith("model name"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    return parts[1].strip()
+    return "Unknown CPU"
+
+
+async def _get_windows_model() -> str:
+    """
+    Retrieve the system model on Windows via wmic.
+
+    Falls back to 'Windows PC' if wmic fails.
+    """
+    try:
+        process = await run_process(
+            ["wmic", "computersystem", "get", "model", "/value"],
+        )
+        output = process.stdout.decode("utf-8", errors="replace").strip()
+        for line in output.splitlines():
+            if line.startswith("Model="):
+                value = line.split("=", 1)[1].strip()
+                if value and value.lower() not in ("", "system product name", "to be filled by o.e.m."):
+                    return value
+    except (CalledProcessError, OSError):
+        pass
+    return "Windows PC"
+
+
+async def _get_windows_chip() -> str:
+    """
+    Retrieve the CPU name on Windows via wmic.
+
+    Falls back to 'Unknown CPU' if wmic fails.
+    """
+    try:
+        process = await run_process(
+            ["wmic", "cpu", "get", "name", "/value"],
+        )
+        output = process.stdout.decode("utf-8", errors="replace").strip()
+        for line in output.splitlines():
+            if line.startswith("Name="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    return value
+    except (CalledProcessError, OSError):
+        pass
+    return "Unknown CPU"
+
+
+async def get_model_and_chip() -> tuple[str, str]:
+    """
+    Get system model and chip/CPU information.
+
+    On macOS, uses system_profiler to retrieve Model Name and Chip.
+    On Linux, reads DMI info for model and /proc/cpuinfo for CPU.
+    On Windows, uses wmic to query system and CPU info.
+    Returns ("Unknown Model", "Unknown Chip") on other platforms or errors.
+    """
+    if sys.platform == "linux":
+        return (_get_linux_model(), _get_linux_chip())
+
+    if sys.platform == "win32":
+        model = await _get_windows_model()
+        chip = await _get_windows_chip()
         return (model, chip)
+
+    if sys.platform != "darwin":
+        return ("Unknown Model", "Unknown Chip")
 
     try:
         process = await run_process(
@@ -67,9 +186,8 @@ async def get_model_and_chip() -> tuple[str, str]:
             ]
         )
     except CalledProcessError:
-        return (model, chip)
+        return ("Unknown Model", "Unknown Chip")
 
-    # less interested in errors here because this value should be hard coded
     output = process.stdout.decode().strip()
 
     model_line = next(

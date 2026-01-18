@@ -33,8 +33,51 @@ class NvidiaGpuInfo(BaseModel):
     temperature: float  # Celsius
     power_draw: float  # Watts
     power_limit: float  # Watts
+    pcie_gen: int | None = None  # PCIe generation (3, 4, 5)
+    pcie_width: int | None = None  # PCIe link width (1, 2, 4, 8, 16)
 
     model_config = ConfigDict(extra="ignore")
+
+
+class NvidiaGpuLink(BaseModel):
+    """Information about a link between two GPUs."""
+
+    gpu_index_a: int
+    gpu_index_b: int
+    link_type: str  # "nvlink", "pcie", "pcie_switch", "system", "unknown"
+    nvlink_count: int = 0  # Number of NVLink bridges (0 if not NVLink)
+    p2p_read_supported: bool = False
+    p2p_write_supported: bool = False
+    p2p_atomics_supported: bool = False
+
+    model_config = ConfigDict(extra="ignore")
+
+    @property
+    def p2p_supported(self) -> bool:
+        """Check if any P2P access is supported."""
+        return self.p2p_read_supported or self.p2p_write_supported
+
+
+class NvidiaTopology(BaseModel):
+    """GPU topology information for multi-GPU systems."""
+
+    gpu_count: int
+    links: list[NvidiaGpuLink] = []
+
+    model_config = ConfigDict(extra="ignore")
+
+    def get_link(self, gpu_a: int, gpu_b: int) -> NvidiaGpuLink | None:
+        """Get the link between two GPUs."""
+        for link in self.links:
+            if (link.gpu_index_a == gpu_a and link.gpu_index_b == gpu_b) or (
+                link.gpu_index_a == gpu_b and link.gpu_index_b == gpu_a
+            ):
+                return link
+        return None
+
+    def has_nvlink(self) -> bool:
+        """Check if any NVLink connections exist."""
+        return any(link.link_type == "nvlink" for link in self.links)
 
 
 class NvidiaMetrics(BaseModel):
@@ -51,6 +94,8 @@ class NvidiaMetrics(BaseModel):
     gpu_memory_free_mb: int
     driver_version: str
     cuda_version: str
+    # Topology information (populated for multi-GPU systems)
+    topology: NvidiaTopology | None = None
 
     model_config = ConfigDict(extra="ignore")
 
@@ -196,6 +241,18 @@ def _get_gpu_info(index: int) -> NvidiaGpuInfo:
     except pynvml.NVMLError:
         power_limit = 0.0
 
+    # PCIe info
+    pcie_gen: int | None = None
+    pcie_width: int | None = None
+    try:
+        pcie_gen = pynvml.nvmlDeviceGetCurrPcieLinkGeneration(handle)
+    except (pynvml.NVMLError, AttributeError):
+        pass
+    try:
+        pcie_width = pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle)
+    except (pynvml.NVMLError, AttributeError):
+        pass
+
     return NvidiaGpuInfo(
         index=index,
         name=name,
@@ -208,7 +265,145 @@ def _get_gpu_info(index: int) -> NvidiaGpuInfo:
         temperature=temperature,
         power_draw=power_draw,
         power_limit=power_limit,
+        pcie_gen=pcie_gen,
+        pcie_width=pcie_width,
     )
+
+
+def _get_gpu_link(index_a: int, index_b: int) -> NvidiaGpuLink:
+    """Get link information between two GPUs."""
+    _ensure_nvml_initialized()
+    pynvml = _get_pynvml()
+
+    handle_a = pynvml.nvmlDeviceGetHandleByIndex(index_a)
+    handle_b = pynvml.nvmlDeviceGetHandleByIndex(index_b)
+
+    # Determine link type using topology common ancestor
+    link_type = "unknown"
+    try:
+        # NVML topology levels (from closest to farthest):
+        # NVML_TOPOLOGY_INTERNAL = 0 (same GPU)
+        # NVML_TOPOLOGY_SINGLE = 10 (NVLink)
+        # NVML_TOPOLOGY_MULTIPLE = 20 (multiple NVLinks)
+        # NVML_TOPOLOGY_HOSTBRIDGE = 30 (same PCIe host bridge)
+        # NVML_TOPOLOGY_NODE = 40 (same NUMA node)
+        # NVML_TOPOLOGY_SYSTEM = 50 (different NUMA nodes)
+        topo_level = pynvml.nvmlDeviceGetTopologyCommonAncestor(handle_a, handle_b)
+
+        # Map topology level to link type
+        if topo_level <= 20:  # SINGLE or MULTIPLE (NVLink)
+            link_type = "nvlink"
+        elif topo_level <= 30:  # HOSTBRIDGE (same PCIe switch/bridge)
+            link_type = "pcie"
+        elif topo_level <= 40:  # NODE (same NUMA, different PCIe)
+            link_type = "pcie_switch"
+        else:  # SYSTEM (different NUMA nodes)
+            link_type = "system"
+    except (pynvml.NVMLError, AttributeError):
+        link_type = "unknown"
+
+    # Count NVLink bridges
+    nvlink_count = 0
+    if link_type == "nvlink":
+        try:
+            # Check each possible NVLink (up to 18 for A100/H100)
+            for link_idx in range(18):
+                try:
+                    state = pynvml.nvmlDeviceGetNvLinkState(handle_a, link_idx)
+                    if state:
+                        # Check if this NVLink connects to the target GPU
+                        try:
+                            remote_pci = pynvml.nvmlDeviceGetNvLinkRemotePciInfo_v2(
+                                handle_a, link_idx
+                            )
+                            target_pci = pynvml.nvmlDeviceGetPciInfo_v3(handle_b)
+                            if remote_pci.busId == target_pci.busId:
+                                nvlink_count += 1
+                        except (pynvml.NVMLError, AttributeError):
+                            # If we can't verify, still count the active link
+                            nvlink_count += 1
+                except pynvml.NVMLError:
+                    break  # No more NVLinks
+        except (pynvml.NVMLError, AttributeError):
+            pass
+
+    # Check P2P capabilities
+    p2p_read = False
+    p2p_write = False
+    p2p_atomics = False
+    try:
+        # NVML_P2P_CAPS_INDEX_READ = 0
+        # NVML_P2P_CAPS_INDEX_WRITE = 1
+        # NVML_P2P_CAPS_INDEX_NVLINK = 2
+        # NVML_P2P_CAPS_INDEX_ATOMICS = 3
+        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+            handle_a, handle_b, pynvml.NVML_P2P_CAPS_INDEX_READ
+        )
+        p2p_read = p2p_status == pynvml.NVML_P2P_STATUS_OK
+    except (pynvml.NVMLError, AttributeError):
+        pass
+
+    try:
+        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+            handle_a, handle_b, pynvml.NVML_P2P_CAPS_INDEX_WRITE
+        )
+        p2p_write = p2p_status == pynvml.NVML_P2P_STATUS_OK
+    except (pynvml.NVMLError, AttributeError):
+        pass
+
+    try:
+        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+            handle_a, handle_b, pynvml.NVML_P2P_CAPS_INDEX_ATOMICS
+        )
+        p2p_atomics = p2p_status == pynvml.NVML_P2P_STATUS_OK
+    except (pynvml.NVMLError, AttributeError):
+        pass
+
+    return NvidiaGpuLink(
+        gpu_index_a=index_a,
+        gpu_index_b=index_b,
+        link_type=link_type,
+        nvlink_count=nvlink_count,
+        p2p_read_supported=p2p_read,
+        p2p_write_supported=p2p_write,
+        p2p_atomics_supported=p2p_atomics,
+    )
+
+
+def get_topology() -> NvidiaTopology | None:
+    """
+    Get GPU topology information for multi-GPU systems.
+
+    Returns None for single-GPU systems.
+    """
+    _ensure_nvml_initialized()
+    pynvml = _get_pynvml()
+
+    gpu_count = pynvml.nvmlDeviceGetCount()
+    if gpu_count < 2:
+        return None
+
+    links: list[NvidiaGpuLink] = []
+    for i in range(gpu_count):
+        for j in range(i + 1, gpu_count):
+            try:
+                link = _get_gpu_link(i, j)
+                links.append(link)
+            except pynvml.NVMLError as e:
+                logger.debug(f"Could not get link info for GPU {i} <-> {j}: {e}")
+
+    topology = NvidiaTopology(gpu_count=gpu_count, links=links)
+
+    # Log topology info
+    if topology.has_nvlink():
+        nvlink_links = [link for link in links if link.link_type == "nvlink"]
+        logger.info(
+            f"GPU topology: {gpu_count} GPUs with {len(nvlink_links)} NVLink connection(s)"
+        )
+    else:
+        logger.info(f"GPU topology: {gpu_count} GPUs connected via PCIe")
+
+    return topology
 
 
 def get_metrics() -> NvidiaMetrics:
@@ -216,7 +411,7 @@ def get_metrics() -> NvidiaMetrics:
     Get comprehensive metrics for all NVIDIA GPUs in the system.
 
     Returns:
-        NvidiaMetrics: Complete metrics including per-GPU details and aggregates.
+        NvidiaMetrics: Complete metrics including per-GPU details, aggregates, and topology.
 
     Raises:
         NvidiaMonitorError: If there's an error accessing GPU metrics.
@@ -252,15 +447,11 @@ def get_metrics() -> NvidiaMetrics:
             try:
                 gpu_info = _get_gpu_info(i)
                 gpus.append(gpu_info)
-            except pynvml.NVMLError as e:
-                # Skip GPUs that can't be queried
+            except pynvml.NVMLError:
                 continue
 
         if not gpus:
             raise NvidiaMonitorError("Could not query any NVIDIA GPUs")
-
-        # Calculate aggregates from primary GPU (index 0)
-        primary_gpu = gpus[0]
 
         # Calculate totals for memory
         total_memory = sum(g.memory_total_mb for g in gpus)
@@ -271,6 +462,9 @@ def get_metrics() -> NvidiaMetrics:
         avg_utilization = sum(g.gpu_utilization for g in gpus) / len(gpus)
         avg_temp = sum(g.temperature for g in gpus) / len(gpus)
         total_power = sum(g.power_draw for g in gpus)
+
+        # Get topology for multi-GPU systems
+        topology = get_topology() if len(gpus) > 1 else None
 
         return NvidiaMetrics(
             gpu_count=len(gpus),
@@ -283,6 +477,7 @@ def get_metrics() -> NvidiaMetrics:
             gpu_memory_free_mb=free_memory,
             driver_version=driver_version,
             cuda_version=cuda_version_str,
+            topology=topology,
         )
 
     except pynvml.NVMLError as e:

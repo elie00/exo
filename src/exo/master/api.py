@@ -64,6 +64,13 @@ from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.dashboard_path import find_dashboard
 from exo.utils.event_buffer import OrderedBuffer
 
+# GGUF Integration imports
+from exo.worker.engines.gguf.exo_integration import get_ollama_model_cards
+from exo.worker.engines.gguf.launcher import run_distributed_node, parse_node_addresses
+import subprocess
+import asyncio
+
+
 encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
 
@@ -88,8 +95,21 @@ async def resolve_model_meta(model_id: str) -> ModelMetadata:
     if model_id in MODEL_CARDS:
         model_card = MODEL_CARDS[model_id]
         return model_card.metadata
-    else:
-        return await get_model_meta(model_id)
+    
+    # Check if it's an Ollama model
+    if model_id.startswith("ollama-") or "ollama" in model_id:
+        try:
+            cards = get_ollama_model_cards()
+            if model_id in cards:
+                return cards[model_id].metadata
+            # Try to find by partial match if needed
+            for card in cards.values():
+                if str(card.model_id) == model_id:
+                    return card.metadata
+        except Exception as e:
+            logger.error(f"Error resolving Ollama metadata: {e}")
+
+    return await get_model_meta(model_id)
 
 
 class API:
@@ -499,6 +519,107 @@ class API:
             "TODO: we should send a notification to the user to download the model"
         )
 
+    async def _run_ollama_inference(self, payload: ChatCompletionTaskParams) -> AsyncGenerator[str, None]:
+        """Run inference using GGUF/Ollama backend."""
+        # Detect model path
+        ollama_cards = get_ollama_model_cards()
+        target_card = None
+        for card in ollama_cards.values():
+            if card.short_id == payload.model or str(card.model_id) == payload.model:
+                target_card = card
+                break
+        
+        if not target_card:
+            yield f"data: {{\"error\": \"Model {payload.model} not found\"}}\n\n"
+            return
+            
+        model_path = target_card.gguf_path
+        logger.info(f"Running GGUF inference on {model_path}")
+
+        # Construct basic local GGUF pipeline for now (single node or auto-detect)
+        # For simplicity in this integration, we run a subprocess that prints tokens
+        # Ideally we would use the DistributedGGUFPipeline class directly if async loop permits
+        
+        # We'll use a wrapper around llama-cpp-python here for immediate feedback
+        # This is a temporary "local" execution mode to satisfy the frontend integration
+        from llama_cpp import Llama
+        
+        # Run in executor to avoid blocking main loop
+        def run_inference_sync():
+            try:
+                llm = Llama(
+                    model_path=str(model_path),
+                    n_ctx=2048,
+                    n_gpu_layers=-1, # Try to use GPU
+                    verbose=False
+                )
+                
+                messages = [{"role": "user", "content": payload.messages[-1].content}] # Simplified
+                if payload.messages:
+                    if payload.messages[-1].role == "user":
+                         prompt = payload.messages[-1].content
+                    else:
+                         prompt = "Hello"
+                
+                stream = llm(
+                    prompt,
+                    max_tokens=payload.max_tokens or 256,
+                    stop=["User:", "\n\n"],
+                    stream=True
+                )
+                
+                for output in stream:
+                    text = output['choices'][0]['text']
+                    yield text
+            except Exception as e:
+                logger.error(f"GGUF Inference error: {e}")
+                return
+
+        # Bridge the sync generator to async
+        queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+        
+        def producer():
+            try:
+                for token in run_inference_sync():
+                     asyncio.run_coroutine_threadsafe(queue.put(token), loop)
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop) # Sentinel
+            except Exception as e:
+                logger.error(f"Producer error: {e}")
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+
+        import threading
+        t = threading.Thread(target=producer)
+        t.start()
+        
+        import time
+        created = int(time.time())
+        
+        while True:
+            token = await queue.get()
+            if token is None:
+                break
+                
+            # Yield in OpenAI format
+            chunk_resp = ChatCompletionResponse(
+                id="gguf-stream",
+                created=created,
+                model=payload.model,
+                choices=[
+                    StreamingChoiceResponse(
+                        index=0,
+                        delta=ChatCompletionMessage(role="assistant", content=token),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+            
+        # Final done
+        yield "data: [DONE]\n\n"
+
+
+
     async def chat_completions(
         self, payload: ChatCompletionTaskParams
     ) -> ChatCompletionResponse | StreamingResponse:
@@ -522,6 +643,13 @@ class API:
         )
         await self._send(command)
         if payload.stream:
+            # Check for Ollama model override
+            if "ollama" in payload.model or payload.model.startswith("ollama-"):
+                return StreamingResponse(
+                    self._run_ollama_inference(payload),
+                    media_type="text/event-stream",
+                )
+
             return StreamingResponse(
                 self._generate_chat_stream(command.command_id, parse_gpt_oss),
                 media_type="text/event-stream",
@@ -553,6 +681,17 @@ class API:
                     supports_tensor=card.metadata.supports_tensor,
                 )
                 for card in MODEL_CARDS.values()
+            ] + [
+                ModelListModel(
+                    id=card.short_id,
+                    hugging_face_id=str(card.model_id),
+                    name=card.name,
+                    description=card.description,
+                    tags=card.tags,
+                    storage_size_megabytes=int(card.metadata.storage_size.in_mb),
+                    supports_tensor=False,
+                )
+                for card in get_ollama_model_cards().values()
             ]
         )
 
