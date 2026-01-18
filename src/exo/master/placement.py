@@ -19,21 +19,67 @@ from exo.shared.types.commands import (
     DeleteInstance,
     PlaceInstance,
 )
+from exo.shared.types.common import NodeId
 from exo.shared.types.events import Event, InstanceCreated, InstanceDeleted
 from exo.shared.types.memory import Memory
+from exo.shared.types.models import ModelId
 from exo.shared.types.topology import NodeInfo
 from exo.shared.types.worker.instances import (
+    GGUFPipelineInstance,
     Instance,
     InstanceId,
     InstanceMeta,
     MlxJacclInstance,
     MlxRingInstance,
 )
+from exo.shared.types.worker.runners import ShardAssignments
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
+from exo.worker.engines.gguf.exo_integration import get_ollama_model_cards
 
 
 def random_ephemeral_port() -> int:
     port = random.randint(49153, 65535)
     return port - 1 if port <= 52415 else 52414
+
+
+def resolve_gguf_model_path(model_id: ModelId) -> str:
+    if not str(model_id).startswith("ollama/"):
+        raise ValueError("GGUF pipeline requires an Ollama/GGUF model id.")
+
+    cards = get_ollama_model_cards()
+    for card in cards.values():
+        if card.model_id == model_id:
+            return str(card.gguf_path)
+
+    raise ValueError(f"GGUF model path not found for {model_id}.")
+
+
+def build_pipeline_ports(nodes: Sequence[NodeInfo]) -> dict[NodeId, int]:
+    ports: dict[NodeId, int] = {}
+    used_ports: set[int] = set()
+
+    for node in nodes:
+        port = random_ephemeral_port()
+        while port in used_ports:
+            port = random_ephemeral_port()
+        used_ports.add(port)
+        ports[node.node_id] = port
+
+    return ports
+
+
+def build_pipeline_node_order(shard_assignments: ShardAssignments) -> list[NodeId]:
+    entries: list[tuple[NodeId, int]] = []
+    for node_id, runner_id in shard_assignments.node_to_runner.items():
+        shard = shard_assignments.runner_to_shard[runner_id]
+        if isinstance(shard, PipelineShardMetadata):
+            entries.append((node_id, shard.device_rank))
+
+    if not entries:
+        return list(shard_assignments.node_to_runner.keys())
+
+    entries.sort(key=lambda item: item[1])
+    return [node_id for node_id, _ in entries]
 
 
 def add_instance_to_placements(
@@ -106,7 +152,7 @@ def place_instance(
     instance_id = InstanceId()
     target_instances = dict(deepcopy(current_instances))
 
-    if len(selected_cycle) == 1:
+    if len(selected_cycle) == 1 and command.instance_meta == InstanceMeta.MlxJaccl:
         logger.warning(
             "You have likely selected ibv for a single node instance; falling back to MlxRing"
         )
@@ -115,6 +161,21 @@ def place_instance(
 
     # TODO: Single node instances
     match command.instance_meta:
+        case InstanceMeta.GGUFPipeline:
+            if command.sharding != Sharding.Pipeline:
+                raise ValueError("GGUF pipeline requires pipeline sharding.")
+
+            gguf_model_path = resolve_gguf_model_path(command.model_meta.model_id)
+            pipeline_ports = build_pipeline_ports(selected_cycle)
+            node_order = build_pipeline_node_order(shard_assignments)
+
+            target_instances[instance_id] = GGUFPipelineInstance(
+                instance_id=instance_id,
+                shard_assignments=shard_assignments,
+                gguf_model_path=gguf_model_path,
+                pipeline_ports=pipeline_ports,
+                node_order=node_order,
+            )
         case InstanceMeta.MlxJaccl:
             mlx_ibv_devices = get_mlx_ibv_devices_matrix(
                 selected_cycle,

@@ -281,26 +281,35 @@ class API:
         if len(list(self.state.topology.list_nodes())) == 0:
             return PlacementPreviewResponse(previews=[])
 
-        cards = [card for card in MODEL_CARDS.values() if card.short_id == model_id]
-        if not cards:
+        cards_by_short_id = {card.short_id: card for card in MODEL_CARDS.values()}
+        cards_by_short_id.update(get_ollama_model_cards())
+        card = cards_by_short_id.get(str(model_id))
+        if card is None:
             raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
 
-        instance_combinations: list[tuple[Sharding, InstanceMeta, int]] = []
-        for sharding in (Sharding.Pipeline, Sharding.Tensor):
-            for instance_meta in (InstanceMeta.MlxRing, InstanceMeta.MlxJaccl):
-                instance_combinations.extend(
-                    [
-                        (sharding, instance_meta, i)
-                        for i in range(
-                            1, len(list(self.state.topology.list_nodes())) + 1
-                        )
-                    ]
-                )
         # TODO: PDD
         # instance_combinations.append((Sharding.PrefillDecodeDisaggregation, InstanceMeta.MlxRing, 1))
 
+        cards = [card]
         for card in cards:
             model_meta = card.metadata
+            is_gguf = "gguf" in card.tags or str(card.model_id).startswith("ollama/")
+            sharding_options = [Sharding.Pipeline]
+            if model_meta.supports_tensor:
+                sharding_options.append(Sharding.Tensor)
+
+            if is_gguf:
+                instance_meta_options = [InstanceMeta.GGUFPipeline]
+            else:
+                instance_meta_options = [InstanceMeta.MlxRing, InstanceMeta.MlxJaccl]
+
+            instance_combinations = [
+                (sharding, instance_meta, i)
+                for sharding in sharding_options
+                for instance_meta in instance_meta_options
+                for i in range(1, len(list(self.state.topology.list_nodes())) + 1)
+            ]
+
             for sharding, instance_meta, min_nodes in instance_combinations:
                 try:
                     placements = get_instance_placements(

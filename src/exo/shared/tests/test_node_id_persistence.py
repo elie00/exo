@@ -29,15 +29,16 @@ def _get_keypair_concurrent_subprocess_task(
 def _get_keypair_concurrent(num_procs: int) -> bytes:
     assert num_procs > 0
 
-    sem = Semaphore(0)
-    ev = Event()
-    queue: QueueT[bytes] = Queue(maxsize=num_procs)
+    context = multiprocessing.get_context("spawn")
+    sem = context.Semaphore(0)
+    ev = context.Event()
+    queue: QueueT[bytes] = context.Queue(maxsize=num_procs)
 
     # make parent process wait for all subprocesses to start
     logger.info(f"PARENT: Starting {num_procs} subprocesses")
     ps: list[BaseProcess] = []
     for _ in range(num_procs):
-        p = multiprocessing.get_context("fork").Process(
+        p = context.Process(
             target=_get_keypair_concurrent_subprocess_task, args=(sem, ev, queue)
         )
         ps.append(p)

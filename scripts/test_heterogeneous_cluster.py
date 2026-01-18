@@ -12,6 +12,8 @@ Usage:
     python scripts/test_heterogeneous_cluster.py --model /path/to/model.gguf
 """
 
+__test__ = False
+
 import argparse
 import asyncio
 import sys

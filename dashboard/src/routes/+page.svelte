@@ -47,9 +47,16 @@ const sidebarVisible = $derived(chatSidebarVisible());
 	let mounted = $state(false);
 
 	// Instance launch state
-	let models = $state<Array<{id: string, name?: string, storage_size_megabytes?: number}>>([]);
+	let models = $state<Array<{
+		id: string;
+		name?: string;
+		storage_size_megabytes?: number;
+		tags?: string[];
+		supports_tensor?: boolean;
+		hugging_face_id?: string;
+	}>>([]);
 	let selectedSharding = $state<'Pipeline' | 'Tensor'>('Pipeline');
-	type InstanceMeta = 'MlxRing' | 'MlxIbv' | 'MlxJaccl';
+	type InstanceMeta = 'MlxRing' | 'MlxJaccl' | 'GGUFPipeline';
 	
 	let selectedInstanceType = $state<InstanceMeta>('MlxRing');
 	let selectedMinNodes = $state<number>(1);
@@ -180,10 +187,38 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 		return { ttft: 300, tps: 50 };
 	}
 	
-	const matchesSelectedRuntime = (runtime: InstanceMeta): boolean =>
-		selectedInstanceType === 'MlxRing'
-			? runtime === 'MlxRing'
-			: runtime === 'MlxIbv' || runtime === 'MlxJaccl';
+	const selectedModelInfo = $derived(() => models.find((m) => m.id === selectedModelId) ?? null);
+	const supportsTensor = $derived(() => selectedModelInfo?.supports_tensor ?? true);
+	const isGgufModel = $derived(() => {
+		const tags = selectedModelInfo?.tags ?? [];
+		const normalizedTags = tags.map((tag) => tag.toLowerCase());
+		return (
+			normalizedTags.includes('gguf') ||
+			normalizedTags.includes('ollama') ||
+			(selectedModelInfo?.id ?? '').startsWith('ollama-') ||
+			(selectedModelInfo?.hugging_face_id ?? '').startsWith('ollama/')
+		);
+	});
+
+	const matchesSelectedRuntime = (runtime: InstanceMeta): boolean => {
+		if (selectedInstanceType === 'MlxRing') return runtime === 'MlxRing';
+		if (selectedInstanceType === 'MlxJaccl') return runtime === 'MlxJaccl';
+		return runtime === 'GGUFPipeline';
+	};
+
+	$effect(() => {
+		if (isGgufModel() && selectedInstanceType !== 'GGUFPipeline') {
+			selectedInstanceType = 'GGUFPipeline';
+		} else if (!isGgufModel() && selectedInstanceType === 'GGUFPipeline') {
+			selectedInstanceType = 'MlxRing';
+		}
+	});
+
+	$effect(() => {
+		if (!supportsTensor() && selectedSharding !== 'Pipeline') {
+			selectedSharding = 'Pipeline';
+		}
+	});
 
 	// Helper to check if a model can be launched (has valid placement with >= minNodes)
 	function canModelFit(modelId: string): boolean {
@@ -191,7 +226,6 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 		// Find previews matching the model, sharding, and instance type
 		const matchingPreviews = previewsData.filter(
 			(p: PlacementPreview) => 
-				p.model_id === modelId && 
 				p.sharding === selectedSharding && 
 				matchesSelectedRuntime(p.instance_meta) &&
 				p.error === null &&
@@ -756,6 +790,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 		let instanceType = 'Unknown';
 		if (instanceTag === 'MlxRingInstance') instanceType = 'MLX Ring';
 		else if (instanceTag === 'MlxIbvInstance' || instanceTag === 'MlxJacclInstance') instanceType = 'MLX RDMA';
+		else if (instanceTag === 'GGUFPipelineInstance') instanceType = 'GGUF Pipeline';
 		
 		const inst = instance as { 
 			shardAssignments?: { 
@@ -920,6 +955,28 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 					missingIface: ifaceInfo.missing
 				});
 			}
+			return rows;
+		}
+
+		// GGUF pipeline – derive order from nodeOrder and display pipeline ports
+		if (instanceTag === 'GGUFPipelineInstance') {
+			const pipelineOrder = (instance as { nodeOrder?: string[] }).nodeOrder || [];
+			const pipelinePorts = (instance as { pipelinePorts?: Record<string, number> }).pipelinePorts || {};
+			const rows: Array<{ from: string; to: string; ip: string; ifaceLabel: string; missingIface: boolean }> = [];
+
+			for (let idx = 0; idx < pipelineOrder.length - 1; idx++) {
+				const fromId = pipelineOrder[idx];
+				const toId = pipelineOrder[idx + 1];
+				const port = pipelinePorts[toId];
+				rows.push({
+					from: getNodeLabel(fromId),
+					to: getNodeLabel(toId),
+					ip: port ? `:${port}` : '?',
+					ifaceLabel: port ? `Pipeline TCP ${port}` : 'Pipeline TCP',
+					missingIface: port === undefined
+				});
+			}
+
 			return rows;
 		}
 
@@ -1508,8 +1565,13 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 										Pipeline
 									</button>
 									<button 
-										onclick={() => selectedSharding = 'Tensor'}
-										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding === 'Tensor' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+										onclick={() => {
+											if (supportsTensor()) {
+												selectedSharding = 'Tensor';
+											}
+										}}
+										disabled={!supportsTensor()}
+										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding === 'Tensor' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'} {supportsTensor() ? '' : 'opacity-40 cursor-not-allowed'}"
 									>
 										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedSharding === 'Tensor' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
 											{#if selectedSharding === 'Tensor'}
@@ -1526,8 +1588,13 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 								<div class="text-xs text-white/70 font-mono mb-2">Instance Type:</div>
 								<div class="flex gap-2">
 									<button 
-										onclick={() => selectedInstanceType = 'MlxRing'}
-										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType === 'MlxRing' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+										onclick={() => {
+											if (!isGgufModel()) {
+												selectedInstanceType = 'MlxRing';
+											}
+										}}
+										disabled={isGgufModel()}
+										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType === 'MlxRing' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'} {isGgufModel() ? 'opacity-40 cursor-not-allowed' : ''}"
 									>
 										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedInstanceType === 'MlxRing' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
 											{#if selectedInstanceType === 'MlxRing'}
@@ -1537,15 +1604,36 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 										MLX Ring
 									</button>
 									<button 
-										onclick={() => selectedInstanceType = 'MlxIbv'}
-										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType === 'MlxIbv' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+										onclick={() => {
+											if (!isGgufModel()) {
+												selectedInstanceType = 'MlxJaccl';
+											}
+										}}
+										disabled={isGgufModel()}
+										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType === 'MlxJaccl' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'} {isGgufModel() ? 'opacity-40 cursor-not-allowed' : ''}"
 									>
-										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedInstanceType === 'MlxIbv' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
-											{#if selectedInstanceType === 'MlxIbv'}
+										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedInstanceType === 'MlxJaccl' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
+											{#if selectedInstanceType === 'MlxJaccl'}
 												<span class="w-2 h-2 rounded-full bg-exo-yellow"></span>
 											{/if}
 										</span>
 										MLX RDMA
+									</button>
+									<button 
+										onclick={() => {
+											if (isGgufModel()) {
+												selectedInstanceType = 'GGUFPipeline';
+											}
+										}}
+										disabled={!isGgufModel()}
+										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType === 'GGUFPipeline' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'} {!isGgufModel() ? 'opacity-40 cursor-not-allowed' : ''}"
+									>
+										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedInstanceType === 'GGUFPipeline' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
+											{#if selectedInstanceType === 'GGUFPipeline'}
+												<span class="w-2 h-2 rounded-full bg-exo-yellow"></span>
+											{/if}
+										</span>
+										GGUF Pipeline
 									</button>
 								</div>
 							</div>
@@ -1616,7 +1704,12 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 								{@const allPreviews = filteredPreviews()}
 								{#if selectedModel && allPreviews.length > 0}
 									{@const downloadStatus = getModelDownloadStatus(selectedModel.id)}
-									{@const tags = modelTags()[selectedModel.id] || []}
+									{@const performanceTags = modelTags()[selectedModel.id] || []}
+									{@const modelTagsFromApi = selectedModel.tags ?? []}
+									{@const tags = Array.from(new Set([...performanceTags, ...modelTagsFromApi]))}
+									{@const huggingFaceId = selectedModel.hugging_face_id && !selectedModel.hugging_face_id.startsWith('ollama/')
+										? selectedModel.hugging_face_id
+										: null}
 									<div class="space-y-3">
 										{#each allPreviews as apiPreview, i}
 										<div
@@ -1642,7 +1735,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 												onLaunch={() => launchInstance(selectedModel.id, apiPreview)}
 												{tags}
 												{apiPreview}
-												modelIdOverride={apiPreview.model_id}
+												modelIdOverride={huggingFaceId}
 											/>
 										</div>
 										{/each}
