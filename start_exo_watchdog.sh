@@ -4,7 +4,7 @@
 CHECK_INTERVAL=30
 HEALTH_URL="http://localhost:52415/node_id"
 LOG_FILE="exo.watchdog.log"
-EXO_CMD="uv run exo"
+EXO_CMD=".venv/bin/python -m exo"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"

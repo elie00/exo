@@ -236,6 +236,31 @@ def discover_ollama_models() -> list[OllamaModel]:
                 logger.warning(f"Error parsing manifest for {model_name}:{tag}: {e}")
                 continue
     
+    
+    # Also scan for local GGUF files in ~/exo/models
+    try:
+        local_models_dir = Path.home() / "exo" / "models"
+        if local_models_dir.exists():
+            for file_path in local_models_dir.glob("*.gguf"):
+                if not file_path.is_file():
+                    continue
+                    
+                model_name = file_path.stem
+                size = file_path.stat().st_size
+                
+                # Create a synthetic OllamaModel
+                model = OllamaModel(
+                    name=model_name.lower().replace("_", "-"),
+                    tag="local",
+                    size_bytes=size,
+                    model_path=file_path,
+                    digest=f"local-{model_name}",
+                )
+                models.append(model)
+                logger.info(f"Discovered Local GGUF model: {model.full_name} ({model.size_gb:.1f} GB)")
+    except Exception as e:
+        logger.error(f"Error scanning local GGUF models: {e}")
+
     return models
 
 
