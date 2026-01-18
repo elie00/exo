@@ -1,6 +1,8 @@
 import time
+import re
+import json as json_module
 from collections.abc import AsyncGenerator
-from typing import cast
+from typing import cast, Any
 
 import anyio
 from anyio import create_task_group
@@ -112,6 +114,182 @@ async def resolve_model_meta(model_id: str) -> ModelMetadata:
     return await get_model_meta(model_id)
 
 
+# ============================================================================
+# Tool Calling Support Helper Functions
+# ============================================================================
+
+def _format_tools_prompt(tools: list[dict[str, Any]]) -> str:
+    """
+    Format tools into a system prompt that instructs the LLM how to call functions.
+    
+    Args:
+        tools: List of tool definitions following OpenAI format
+        
+    Returns:
+        A formatted string to inject into the system prompt
+    """
+    if not tools:
+        return ""
+    
+    tool_descriptions: list[str] = []
+    example_calls: list[str] = []
+    
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+        func = tool.get("function", {})
+        name = func.get("name", "unknown")
+        description = func.get("description", "No description")
+        parameters = func.get("parameters", {})
+        
+        # Format parameters
+        params_str = ""
+        example_args = {}
+        if parameters.get("properties"):
+            param_list = []
+            for param_name, param_info in parameters["properties"].items():
+                param_type = param_info.get("type", "string")
+                param_desc = param_info.get("description", "")
+                required = param_name in parameters.get("required", [])
+                req_marker = " [REQUIRED]" if required else ""
+                param_list.append(f"  • {param_name} ({param_type}){req_marker}: {param_desc}")
+                # Generate example value
+                if param_type == "string":
+                    example_args[param_name] = f"example_{param_name}"
+                elif param_type == "number" or param_type == "integer":
+                    example_args[param_name] = 42
+                elif param_type == "boolean":
+                    example_args[param_name] = True
+                else:
+                    example_args[param_name] = f"value"
+            params_str = "\n" + "\n".join(param_list)
+        
+        tool_descriptions.append(f"• {name}: {description}{params_str}")
+        example_calls.append(f'{{"name": "{name}", "arguments": {json_module.dumps(example_args)}}}')
+    
+    if not tool_descriptions:
+        return ""
+    
+    # Build a more forceful, explicit prompt
+    tools_list = "\n".join(tool_descriptions)
+    first_example = example_calls[0] if example_calls else '{"name": "function_name", "arguments": {}}'
+    
+    return f"""[TOOL USE INSTRUCTIONS]
+You have access to these functions:
+
+{tools_list}
+
+IMPORTANT: When the user's request requires using a function, you MUST respond with ONLY the following format - no other text before or after:
+
+<tool_call>
+{first_example}
+</tool_call>
+
+RULES:
+1. If you need to call a function, respond with ONLY the <tool_call> block
+2. Do NOT explain what you're doing - just output the tool_call
+3. Do NOT add any text before or after the <tool_call> tags
+4. The JSON inside must be valid with "name" and "arguments" fields
+5. If you don't need a function, respond normally without tool_call tags
+
+Example - if asked "What's the weather in Paris?", respond EXACTLY like this:
+<tool_call>
+{{"name": "get_weather", "arguments": {{"city": "Paris"}}}}
+</tool_call>
+"""
+
+
+def _extract_tool_calls(response_text: str) -> tuple[str, list[dict[str, Any]] | None]:
+    """
+    Extract tool calls from LLM response and return clean content.
+    
+    Args:
+        response_text: Raw response text from the LLM
+        
+    Returns:
+        Tuple of (cleaned_content, tool_calls or None)
+        - cleaned_content: Response text with tool_call tags removed
+        - tool_calls: List of tool call objects in OpenAI format, or None if no calls found
+    """
+    # Pattern to match <tool_call>...</tool_call>
+    pattern = r'<tool_call>\s*(.*?)\s*</tool_call>'
+    matches = re.findall(pattern, response_text, re.DOTALL)
+    
+    if not matches:
+        return response_text, None
+    
+    tool_calls: list[dict[str, Any]] = []
+    for i, match in enumerate(matches):
+        try:
+            # Parse the JSON inside the tool_call tags
+            call_data = json_module.loads(match.strip())
+            
+            # Convert to OpenAI tool_call format
+            tool_call = {
+                "id": f"call_{i}",
+                "type": "function",
+                "function": {
+                    "name": call_data.get("name", ""),
+                    "arguments": json_module.dumps(call_data.get("arguments", {}))
+                }
+            }
+            tool_calls.append(tool_call)
+        except json_module.JSONDecodeError as e:
+            logger.warning(f"Failed to parse tool call JSON: {e}")
+            continue
+    
+    # Remove tool_call tags from content
+    cleaned_content = re.sub(pattern, '', response_text, flags=re.DOTALL).strip()
+    
+    if not tool_calls:
+        return response_text, None
+    
+    return cleaned_content, tool_calls
+
+
+def _inject_tools_into_messages(
+    messages: list[ChatCompletionMessage],
+    tools: list[dict[str, Any]] | None
+) -> list[ChatCompletionMessage]:
+    """
+    Inject tool descriptions into the messages as a system message.
+    
+    Args:
+        messages: Original list of messages
+        tools: Tool definitions to inject
+        
+    Returns:
+        Modified messages list with tool instructions prepended
+    """
+    if not tools:
+        return messages
+    
+    tools_prompt = _format_tools_prompt(tools)
+    if not tools_prompt:
+        return messages
+    
+    # Create a new system message with tool instructions
+    tool_system_msg = ChatCompletionMessage(
+        role="system",
+        content=tools_prompt
+    )
+    
+    # Prepend to messages (or merge with existing system message)
+    new_messages = list(messages)
+    if new_messages and new_messages[0].role == "system":
+        # Append to existing system message
+        existing_content = new_messages[0].content or ""
+        new_messages[0] = ChatCompletionMessage(
+            role="system",
+            content=f"{existing_content}\n\n{tools_prompt}"
+        )
+    else:
+        # Prepend new system message
+        new_messages.insert(0, tool_system_msg)
+    
+    return new_messages
+
+
 class API:
     def __init__(
         self,
@@ -154,6 +332,9 @@ class API:
 
         self._chat_completion_queues: dict[CommandId, Sender[TokenChunk]] = {}
         self._tg: TaskGroup | None = None
+        
+        # Track active requests for cancellation support
+        self._active_requests: dict[CommandId, anyio.CancelScope] = {}
         
         # Ollama cluster nodes: [(host, port), ...]
         # Always includes localhost:11434 as the first node
@@ -199,11 +380,26 @@ class API:
         self.app.get("/state")(lambda: self.state)
         self.app.get("/events")(lambda: self._event_log)
         
+        # GPU information endpoint
+        self.app.get("/gpu/info")(self.get_gpu_info)
+        
         # Ollama cluster management routes
         self.app.get("/ollama/nodes")(self.get_ollama_nodes)
         self.app.post("/ollama/nodes")(self.add_ollama_node)
         self.app.delete("/ollama/nodes/{host}")(self.remove_ollama_node)
         self.app.post("/ollama/generate")(self.generate_ollama)
+        
+        # Request cancellation endpoint
+        self.app.delete("/v1/chat/completions/{command_id}")(self.cancel_completion)
+        self.app.get("/v1/chat/completions/active")(self.list_active_requests)
+        
+        # Network profiling endpoints
+        self.app.get("/network/profile")(self.get_network_profile)
+        self.app.post("/network/bandwidth_test")(self.bandwidth_test_endpoint)
+        
+        # Image generation endpoint
+        self.app.post("/v1/images/generate")(self.generate_image)
+        self.app.post("/v1/images/generations")(self.generate_image)  # OpenAI compat
 
 
     async def place_instance(self, payload: PlaceInstanceParams):
@@ -489,7 +685,7 @@ class API:
                 yield "data: [DONE]\n\n"
 
     async def _collect_chat_completion(
-        self, command_id: CommandId, parse_gpt_oss: bool
+        self, command_id: CommandId, parse_gpt_oss: bool, has_tools: bool = False
     ) -> ChatCompletionResponse:
         """Collect all token chunks for a chat completion and return a single response."""
 
@@ -509,6 +705,16 @@ class API:
         combined_text = "".join(text_parts)
         assert model is not None
 
+        # Extract tool calls if tools were provided
+        tool_calls = None
+        content = combined_text
+        if has_tools:
+            content, tool_calls = _extract_tool_calls(combined_text)
+            if tool_calls:
+                # When there are tool calls, finish_reason should be "tool_calls"
+                finish_reason = "tool_calls"
+                logger.info(f"Extracted {len(tool_calls)} tool call(s) from response")
+
         return ChatCompletionResponse(
             id=command_id,
             created=int(time.time()),
@@ -518,7 +724,8 @@ class API:
                     index=0,
                     message=ChatCompletionMessage(
                         role="assistant",
-                        content=combined_text,
+                        content=content if content else None,
+                        tool_calls=tool_calls,
                     ),
                     finish_reason=finish_reason,
                 )
@@ -754,6 +961,34 @@ class API:
         payload.model = model_meta.model_id
         parse_gpt_oss = "gpt-oss" in model_meta.model_id.lower()
         logger.info(f"{parse_gpt_oss=}")
+        
+        # Tool calling support: inject tools into messages
+        has_tools = bool(payload.tools)
+        if has_tools:
+            logger.info(f"Tool calling enabled with {len(payload.tools)} tool(s)")
+            # Create a modified payload with tools injected into messages
+            modified_messages = _inject_tools_into_messages(payload.messages, payload.tools)
+            payload = ChatCompletionTaskParams(
+                model=payload.model,
+                messages=modified_messages,
+                frequency_penalty=payload.frequency_penalty,
+                logit_bias=payload.logit_bias,
+                logprobs=payload.logprobs,
+                top_logprobs=payload.top_logprobs,
+                max_tokens=payload.max_tokens,
+                n=payload.n,
+                presence_penalty=payload.presence_penalty,
+                response_format=payload.response_format,
+                seed=payload.seed,
+                stop=payload.stop,
+                stream=payload.stream,
+                temperature=payload.temperature,
+                top_p=payload.top_p,
+                tools=payload.tools,
+                tool_choice=payload.tool_choice,
+                parallel_tool_calls=payload.parallel_tool_calls,
+                user=payload.user,
+            )
 
         if not any(
             instance.shard_assignments.model_id == payload.model
@@ -774,7 +1009,7 @@ class API:
                 media_type="text/event-stream",
             )
 
-        return await self._collect_chat_completion(command.command_id, parse_gpt_oss)
+        return await self._collect_chat_completion(command.command_id, parse_gpt_oss, has_tools)
 
     def _calculate_total_available_memory(self) -> Memory:
         """Calculate total available memory across all nodes in bytes."""
@@ -785,6 +1020,71 @@ class API:
                 total_available += node.node_profile.memory.ram_available
 
         return total_available
+
+    async def get_gpu_info(self):
+        """Get GPU information for all nodes in the cluster."""
+        nodes_gpu_info = []
+        total_vram_mb = 0
+        total_vram_available_mb = 0
+        gpu_node_count = 0
+
+        for node in self.state.topology.list_nodes():
+            node_info = {
+                "node_id": str(node.node_id),
+                "has_gpu": False,
+                "gpu_count": 0,
+                "device_name": None,
+                "vram_total_mb": 0,
+                "vram_available_mb": 0,
+                "vram_used_mb": 0,
+                "driver_version": None,
+                "cuda_version": None,
+                "gpu_usage_percent": 0.0,
+                "gpu_temp_celsius": 0.0,
+            }
+
+            if node.node_profile is not None:
+                system = node.node_profile.system
+                memory = node.node_profile.memory
+
+                # Check SystemPerformanceProfile for GPU info
+                if system.has_gpu_memory:
+                    node_info["has_gpu"] = True
+                    node_info["gpu_count"] = system.gpu_count or 1
+                    node_info["vram_total_mb"] = system.gpu_memory_total_mb or 0
+                    node_info["vram_available_mb"] = system.gpu_memory_available_mb
+                    node_info["vram_used_mb"] = system.gpu_memory_used_mb or 0
+                    node_info["driver_version"] = system.driver_version
+                    node_info["cuda_version"] = system.cuda_version
+                    node_info["gpu_usage_percent"] = system.gpu_usage
+                    node_info["gpu_temp_celsius"] = system.temp
+
+                    total_vram_mb += node_info["vram_total_mb"]
+                    total_vram_available_mb += node_info["vram_available_mb"]
+                    gpu_node_count += 1
+
+                # Also check MemoryPerformanceProfile for VRAM (new fields)
+                if memory.has_gpu_vram:
+                    node_info["has_gpu"] = True
+                    if memory.gpu_vram_total:
+                        node_info["vram_total_mb"] = int(memory.gpu_vram_total.in_mb)
+                    if memory.gpu_vram_available:
+                        node_info["vram_available_mb"] = int(memory.gpu_vram_available.in_mb)
+                    if memory.gpu_vram_used:
+                        node_info["vram_used_mb"] = int(memory.gpu_vram_used.in_mb)
+
+            nodes_gpu_info.append(node_info)
+
+        return {
+            "cluster_summary": {
+                "total_nodes": len(nodes_gpu_info),
+                "gpu_nodes": gpu_node_count,
+                "total_vram_mb": total_vram_mb,
+                "total_vram_available_mb": total_vram_available_mb,
+                "gpu_aware_placement_enabled": gpu_node_count > 0,
+            },
+            "nodes": nodes_gpu_info,
+        }
 
     async def get_models(self) -> ModelList:
         """Returns list of available models."""
@@ -813,6 +1113,150 @@ class API:
                 for card in get_ollama_model_cards().values()
             ]
         )
+
+    # ==================== Request Cancellation ====================
+    
+    async def cancel_completion(self, command_id: str):
+        """Cancel an active chat completion request."""
+        if command_id in self._active_requests:
+            scope = self._active_requests[command_id]
+            scope.cancel()
+            logger.info(f"Cancelled request {command_id}")
+            return {
+                "status": "cancelled",
+                "command_id": command_id,
+                "message": "Request cancelled successfully"
+            }
+        
+        # Check if it's a known completed request (in queues)
+        if command_id in self._chat_completion_queues:
+            return {
+                "status": "pending",
+                "command_id": command_id,
+                "message": "Request found in queue but not yet actively processing"
+            }
+        
+        raise HTTPException(
+            status_code=404,
+            detail=f"Request {command_id} not found. It may have already completed or never existed."
+        )
+    
+    async def list_active_requests(self):
+        """List all active chat completion requests that can be cancelled."""
+        active = []
+        for command_id, scope in self._active_requests.items():
+            active.append({
+                "command_id": command_id,
+                "cancelled": scope.cancel_called,
+            })
+        
+        pending = []
+        for command_id in self._chat_completion_queues.keys():
+            if command_id not in self._active_requests:
+                pending.append({
+                    "command_id": command_id,
+                    "status": "pending"
+                })
+        
+        return {
+            "active_count": len(active),
+            "pending_count": len(pending),
+            "active_requests": active,
+            "pending_requests": pending,
+        }
+
+    # ==================== Network Profiling ====================
+    
+    async def get_network_profile(self):
+        """Get network latency and connection info for all cluster nodes."""
+        from exo.worker.utils.net_profiler import get_network_profiler, ConnectionType
+        
+        profiler = get_network_profiler(self.port)
+        
+        # Build node address map from topology
+        node_addresses: dict[str, str] = {}
+        for node in self.state.topology.list_nodes():
+            # Try to get IP from connections
+            for conn in self.state.topology.connections:
+                if conn.local_node_id == node.node_id:
+                    if conn.send_back_multiaddr:
+                        ip = conn.send_back_multiaddr.ip_address
+                        if ip:
+                            node_addresses[str(node.node_id)] = ip
+                            break
+        
+        # Profile connections
+        from exo.shared.types.common import NodeId
+        metrics = await profiler.profile_all_connections(
+            self.node_id,
+            {NodeId(k): v for k, v in node_addresses.items()}
+        )
+        
+        results = []
+        for m in metrics:
+            results.append({
+                "target_node": str(m.target_node),
+                "target_ip": m.target_ip,
+                "latency_ms": round(m.latency_ms, 2),
+                "latency_min_ms": round(m.latency_min_ms, 2),
+                "latency_max_ms": round(m.latency_max_ms, 2),
+                "latency_stddev_ms": round(m.latency_stddev_ms, 2),
+                "connection_type": m.connection_type.value,
+                "interface": m.interface_name,
+                "measured_at": m.measured_at,
+            })
+        
+        return {
+            "source_node": str(self.node_id),
+            "profiles": results,
+            "summary": {
+                "nodes_profiled": len(results),
+                "avg_latency_ms": round(sum(r["latency_ms"] for r in results) / len(results), 2) if results else 0,
+            }
+        }
+    
+    async def bandwidth_test_endpoint(self, request):
+        """Endpoint for bandwidth testing - echoes back received data."""
+        from fastapi import Request
+        body = await request.body()
+        return {"received_bytes": len(body), "echo": True}
+
+    # ==================== Image Generation ====================
+    
+    async def generate_image(self, request: dict):
+        """Generate images using distributed diffusion models."""
+        from exo.worker.engines.image.image_generator import (
+            get_image_generator,
+            ImageGenerationRequest,
+        )
+        
+        try:
+            # Parse request
+            gen_request = ImageGenerationRequest(
+                model=request.get("model", "flux-schnell"),
+                prompt=request.get("prompt", ""),
+                negative_prompt=request.get("negative_prompt"),
+                size=request.get("size", "1024x1024"),
+                n=request.get("n", 1),
+                quality=request.get("quality", "standard"),
+                response_format=request.get("response_format", "b64_json"),
+                guidance_scale=request.get("guidance_scale", 7.5),
+                num_inference_steps=request.get("num_inference_steps", 50),
+                seed=request.get("seed"),
+            )
+            
+            # Generate
+            generator = get_image_generator()
+            response = await generator.generate(gen_request)
+            
+            return response.model_dump()
+            
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Image generation failed: {str(e)}"
+            )
 
     # ==================== Ollama Cluster Management ====================
     

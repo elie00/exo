@@ -58,7 +58,7 @@ async def get_metrics_async() -> AnyMetrics | None:
 
 
 def get_memory_profile() -> MemoryPerformanceProfile:
-    """Construct a MemoryPerformanceProfile using psutil"""
+    """Construct a MemoryPerformanceProfile using psutil and optional GPU info."""
     override_memory_env = os.getenv("OVERRIDE_MEMORY_MB")
     override_memory: int | None = (
         Memory.from_mb(int(override_memory_env)).in_bytes
@@ -66,7 +66,25 @@ def get_memory_profile() -> MemoryPerformanceProfile:
         else None
     )
 
-    return MemoryPerformanceProfile.from_psutil(override_memory=override_memory)
+    # Try to get GPU VRAM info
+    gpu_vram_total: int | None = None
+    gpu_vram_used: int | None = None
+
+    if is_nvidia_available():
+        try:
+            from exo.worker.utils.nvidia_monitor import get_metrics
+            metrics = get_metrics()
+            # Convert MB to bytes
+            gpu_vram_total = metrics.gpu_memory_total_mb * 1024 * 1024
+            gpu_vram_used = metrics.gpu_memory_used_mb * 1024 * 1024
+        except Exception as e:
+            logger.debug(f"Failed to get GPU VRAM info: {e}")
+
+    return MemoryPerformanceProfile.from_psutil(
+        override_memory=override_memory,
+        gpu_vram_total=gpu_vram_total,
+        gpu_vram_used=gpu_vram_used,
+    )
 
 
 async def start_polling_memory_metrics(

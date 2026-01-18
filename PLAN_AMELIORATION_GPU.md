@@ -8,12 +8,14 @@
 - ✅ **Device selection** : `mx.set_default_device(mx.gpu)` + `mx.metal.is_available()`
 - ✅ **Télémétrie** : `NodePerformanceProfile.system.gpu_usage` remonté dans `/state`
 
-### Linux (bloqué CPU)
-- ❌ **Pas de détection GPU** : Aucun code NVML/pynvml pour détecter NVIDIA RTX
-- ❌ **MLX forcé CPU** : `mlx[cpu]>=0.30.1` dans `pyproject.toml` ligne 33
-- ❌ **Pas de backend CUDA** : Option `mlx[cuda]` commentée (ligne 57-59)
-- ❌ **Placement ignorant GPU** : Seule la RAM système est utilisée, pas la VRAM GPU
-- ⚠️ **Télémétrie GPU vide** : `gpu_usage=0.0` par défaut (ligne 247 `apply.py`)
+### Linux (✅ IMPLÉMENTÉ)
+- ✅ **Détection GPU** : `nvidia_monitor.py` via pynvml détecte les GPU NVIDIA RTX
+- ✅ **MLX CUDA** : Support via `mlx[cuda]>=0.30.1` avec `--extra cuda`
+- ✅ **GGUF/llama.cpp CUDA** : `n_gpu_layers` calculé automatiquement selon VRAM
+- ✅ **Placement GPU-aware** : VRAM utilisée pour placement si `prefer_gpu=True`
+- ✅ **Télémétrie GPU** : VRAM, utilisation, température exposés via `/gpu/info`
+- ✅ **API endpoint** : `/gpu/info` retourne l'état GPU de tous les nœuds
+
 
 ---
 

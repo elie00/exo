@@ -61,6 +61,8 @@ class GGUFInferenceEngine:
     
     Uses llama-cpp-python with RPC backend for true distributed inference
     where model weights are split across multiple nodes.
+    
+    Supports CUDA GPU acceleration on Linux with NVIDIA GPUs.
     """
     
     def __init__(self, config: GGUFRPCConfig):
@@ -69,6 +71,78 @@ class GGUFInferenceEngine:
         self._tokenizer = None
         self._process: Optional[subprocess.Popen[bytes]] = None
         self._running = False
+        self._gpu_info = self._detect_gpu()
+    
+    def _detect_gpu(self) -> dict:
+        """Detect available GPU and return configuration info."""
+        gpu_info = {
+            "available": False,
+            "cuda_available": False,
+            "device_name": None,
+            "vram_total_mb": 0,
+            "vram_free_mb": 0,
+            "recommended_gpu_layers": -1,
+        }
+        
+        try:
+            from exo.worker.utils.nvidia_monitor import is_nvidia_available, get_metrics
+            
+            if is_nvidia_available():
+                metrics = get_metrics()
+                gpu_info["available"] = True
+                gpu_info["cuda_available"] = True
+                gpu_info["vram_total_mb"] = metrics.gpu_memory_total_mb
+                gpu_info["vram_free_mb"] = metrics.gpu_memory_free_mb
+                gpu_info["cuda_version"] = metrics.cuda_version
+                gpu_info["driver_version"] = metrics.driver_version
+                
+                if metrics.gpus:
+                    gpu_info["device_name"] = metrics.gpus[0].name
+                
+                # Calculate recommended GPU layers based on available VRAM
+                # Rough estimate: ~100MB per layer for quantized models
+                vram_for_layers = gpu_info["vram_free_mb"] - 500  # Reserve 500MB
+                gpu_info["recommended_gpu_layers"] = max(0, vram_for_layers // 100)
+                
+                logger.info(
+                    f"CUDA GPU detected: {gpu_info['device_name']} "
+                    f"({gpu_info['vram_free_mb']}MB free VRAM, "
+                    f"recommended layers: {gpu_info['recommended_gpu_layers']})"
+                )
+        except ImportError:
+            logger.debug("pynvml not available for GPU detection")
+        except Exception as e:
+            logger.debug(f"GPU detection failed: {e}")
+        
+        return gpu_info
+    
+    def _get_optimal_gpu_layers(self, model_info: Optional[GGUFModelInfo] = None) -> int:
+        """Calculate optimal number of GPU layers based on model size and VRAM."""
+        if not self._gpu_info["cuda_available"]:
+            return 0
+        
+        # If config specifies layers, use that
+        if self.config.n_gpu_layers >= 0:
+            return self.config.n_gpu_layers
+        
+        # If we have model info, calculate based on model size
+        if model_info and self._gpu_info["vram_free_mb"] > 0:
+            # Estimate memory per layer
+            model_size_mb = model_info.file_size_bytes / (1024 * 1024)
+            n_layers = model_info.n_layers
+            memory_per_layer = model_size_mb / n_layers if n_layers > 0 else 100
+            
+            available_vram = self._gpu_info["vram_free_mb"] - 500  # Reserve 500MB
+            max_layers = int(available_vram / memory_per_layer)
+            
+            logger.info(
+                f"Model: {n_layers} layers, ~{memory_per_layer:.0f}MB/layer. "
+                f"VRAM: {self._gpu_info['vram_free_mb']}MB. Offloading {min(max_layers, n_layers)} layers to GPU."
+            )
+            return min(max_layers, n_layers)
+        
+        # Fallback to recommended layers
+        return self._gpu_info.get("recommended_gpu_layers", -1)
     
     @property
     def is_running(self) -> bool:
@@ -131,14 +205,15 @@ class GGUFInferenceEngine:
     async def _start_main_server(self) -> None:
         """Start as the main inference server.
         
-        Loads the model with RPC workers configured.
+        Loads the model with RPC workers configured and optimal GPU offloading.
         """
         try:
             from llama_cpp import Llama
         except ImportError:
             raise ImportError(
                 "llama-cpp-python is required for GGUF inference. "
-                "Install with: pip install llama-cpp-python"
+                "Install with: pip install llama-cpp-python\n"
+                "For CUDA support: CMAKE_ARGS='-DLLAMA_CUBLAS=on' pip install llama-cpp-python"
             )
         
         logger.info(f"Starting GGUF main server with model: {self.config.model_path.name}")
@@ -149,6 +224,31 @@ class GGUFInferenceEngine:
             rpc_servers = ",".join(self.config.worker_addresses)
             logger.info(f"Connecting to RPC workers: {rpc_servers}")
         
+        # Load model metadata to calculate optimal GPU layers
+        model_info: Optional[GGUFModelInfo] = None
+        try:
+            model_info = load_gguf_metadata(self.config.model_path)
+            logger.info(
+                f"Model info: {model_info.architecture}, "
+                f"{model_info.n_layers} layers, "
+                f"{model_info.file_size_bytes / (1024**3):.1f}GB"
+            )
+        except Exception as e:
+            logger.warning(f"Could not load model metadata: {e}")
+        
+        # Calculate optimal GPU layers
+        n_gpu_layers = self._get_optimal_gpu_layers(model_info)
+        
+        # Log GPU configuration
+        if self._gpu_info["cuda_available"]:
+            logger.info(
+                f"CUDA enabled: offloading {n_gpu_layers} layers to "
+                f"{self._gpu_info['device_name']} "
+                f"(CUDA {self._gpu_info.get('cuda_version', 'N/A')})"
+            )
+        else:
+            logger.info("CUDA not available, using CPU inference")
+        
         # Load model with llama-cpp-python
         # Note: RPC support requires llama-cpp-python built with RPC enabled
         self._model = Llama(
@@ -156,13 +256,16 @@ class GGUFInferenceEngine:
             n_ctx=self.config.context_size,
             n_batch=self.config.batch_size,
             n_threads=self.config.threads if self.config.threads > 0 else None,
-            n_gpu_layers=self.config.n_gpu_layers,
+            n_gpu_layers=n_gpu_layers,
             # rpc_servers=rpc_servers,  # Enable when RPC is configured
             verbose=True,
         )
         
         self._running = True
-        logger.info("GGUF main server started successfully")
+        logger.info(
+            f"GGUF main server started successfully "
+            f"(GPU layers: {n_gpu_layers}, context: {self.config.context_size})"
+        )
     
     async def stop(self) -> None:
         """Stop the inference engine."""

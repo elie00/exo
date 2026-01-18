@@ -21,7 +21,8 @@ use pyo3::types::PyBytes;
 use pyo3::{Bound, Py, PyErr, PyResult, PyTraverseError, PyVisit, Python, pymethods};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
 use std::net::IpAddr;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use util::ext::VecExt as _;
 
 mod exception {
@@ -153,6 +154,7 @@ async fn networking_task(
     mut to_task_rx: mpsc::Receiver<ToTask>,
     connection_update_tx: mpsc::Sender<PyConnectionUpdate>,
     gossipsub_message_tx: mpsc::Sender<(String, Vec<u8>)>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     use SwarmEvent::*;
     use ToTask::*;
@@ -163,6 +165,13 @@ async fn networking_task(
 
     loop {
         tokio::select! {
+            // Priority: check shutdown signal first
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    log::info!("RUST: shutdown signal received, stopping networking task");
+                    break;
+                }
+            }
             message = to_task_rx.recv() => {
                 // handle closed channel
                 let Some(message) = message else {
@@ -301,14 +310,27 @@ struct PyNetworkingHandle {
     to_task_tx: Option<mpsc::Sender<ToTask>>,
     connection_update_rx: Mutex<mpsc::Receiver<PyConnectionUpdate>>,
     gossipsub_message_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
+    // shutdown coordination
+    shutdown_tx: Option<watch::Sender<bool>>,
+    task_handle: Option<JoinHandle<()>>,
 }
 
 impl Drop for PyNetworkingHandle {
     fn drop(&mut self) {
-        // TODO: may or may not need to await a "kill-signal" oneshot channel message,
-        //       to ensure that the networking task is done BEFORE exiting the clear function...
-        //       but this may require GIL?? and it may not be safe to call GIL here??
-        self.to_task_tx = None; // Using Option<T> as a trick to force channel to be dropped
+        // Signal shutdown to the networking task
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        
+        // Drop channels first to unblock any pending operations
+        self.to_task_tx = None;
+        
+        // Abort the task - this is safe since we've already signaled shutdown
+        // and the task will clean up gracefully when the shutdown signal is received
+        if let Some(handle) = self.task_handle.take() {
+            // Abort is non-blocking and safe to call from Drop
+            handle.abort();
+        }
     }
 }
 
@@ -318,11 +340,15 @@ impl PyNetworkingHandle {
         to_task_tx: mpsc::Sender<ToTask>,
         connection_update_rx: mpsc::Receiver<PyConnectionUpdate>,
         gossipsub_message_rx: mpsc::Receiver<(String, Vec<u8>)>,
+        shutdown_tx: watch::Sender<bool>,
+        task_handle: JoinHandle<()>,
     ) -> Self {
         Self {
             to_task_tx: Some(to_task_tx),
             connection_update_rx: Mutex::new(connection_update_rx),
             gossipsub_message_rx: Mutex::new(gossipsub_message_rx),
+            shutdown_tx: Some(shutdown_tx),
+            task_handle: Some(task_handle),
         }
     }
 
@@ -350,6 +376,9 @@ impl PyNetworkingHandle {
         let (to_task_tx, to_task_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
         let (connection_update_tx, connection_update_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
         let (gossipsub_message_tx, gossipsub_message_rx) = mpsc::channel(MPSC_CHANNEL_SIZE);
+        
+        // create shutdown signal channel
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // get identity
         let identity = identity.borrow().0.clone();
@@ -360,12 +389,13 @@ impl PyNetworkingHandle {
             .pyerr()?;
 
         // spawn tokio task running the networking logic
-        get_runtime().spawn(async move {
+        let task_handle = get_runtime().spawn(async move {
             networking_task(
                 swarm,
                 to_task_rx,
                 connection_update_tx,
                 gossipsub_message_tx,
+                shutdown_rx,
             )
             .await;
         });
@@ -373,6 +403,8 @@ impl PyNetworkingHandle {
             to_task_tx,
             connection_update_rx,
             gossipsub_message_rx,
+            shutdown_tx,
+            task_handle,
         ))
     }
 
@@ -383,10 +415,16 @@ impl PyNetworkingHandle {
 
     #[gen_stub(skip)]
     fn __clear__(&mut self) {
-        // TODO: may or may not need to await a "kill-signal" oneshot channel message,
-        //       to ensure that the networking task is done BEFORE exiting the clear function...
-        //       but this may require GIL?? and it may not be safe to call GIL here??
-        self.to_task_tx = None; // Using Option<T> as a trick to force channel to be dropped
+        // Signal shutdown to the networking task (same as Drop)
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        self.to_task_tx = None;
+        // Note: we don't wait for task completion here since __clear__ is called during GC
+        // and blocking could cause issues. The Drop impl handles proper cleanup.
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
     }
 
     // ---- Connection update receiver methods ----

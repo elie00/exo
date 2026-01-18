@@ -11,28 +11,62 @@ class MemoryPerformanceProfile(CamelCaseModel):
     ram_available: Memory
     swap_total: Memory
     swap_available: Memory
+    # GPU VRAM fields for NVIDIA GPUs (populated on Linux with NVIDIA GPUs)
+    gpu_vram_total: Memory | None = None
+    gpu_vram_available: Memory | None = None
+    gpu_vram_used: Memory | None = None
+
+    @property
+    def has_gpu_vram(self) -> bool:
+        """Check if GPU VRAM information is available."""
+        return self.gpu_vram_total is not None and self.gpu_vram_total.in_bytes > 0
 
     @classmethod
     def from_bytes(
-        cls, *, ram_total: int, ram_available: int, swap_total: int, swap_available: int
+        cls,
+        *,
+        ram_total: int,
+        ram_available: int,
+        swap_total: int,
+        swap_available: int,
+        gpu_vram_total: int | None = None,
+        gpu_vram_available: int | None = None,
+        gpu_vram_used: int | None = None,
     ) -> Self:
         return cls(
             ram_total=Memory.from_bytes(ram_total),
             ram_available=Memory.from_bytes(ram_available),
             swap_total=Memory.from_bytes(swap_total),
             swap_available=Memory.from_bytes(swap_available),
+            gpu_vram_total=Memory.from_bytes(gpu_vram_total) if gpu_vram_total else None,
+            gpu_vram_available=Memory.from_bytes(gpu_vram_available) if gpu_vram_available else None,
+            gpu_vram_used=Memory.from_bytes(gpu_vram_used) if gpu_vram_used else None,
         )
 
     @classmethod
-    def from_psutil(cls, *, override_memory: int | None) -> Self:
+    def from_psutil(
+        cls,
+        *,
+        override_memory: int | None,
+        gpu_vram_total: int | None = None,
+        gpu_vram_used: int | None = None,
+    ) -> Self:
         vm = psutil.virtual_memory()
         sm = psutil.swap_memory()
+
+        # Calculate available VRAM
+        gpu_vram_available = None
+        if gpu_vram_total is not None and gpu_vram_used is not None:
+            gpu_vram_available = max(0, gpu_vram_total - gpu_vram_used)
 
         return cls.from_bytes(
             ram_total=vm.total,
             ram_available=vm.available if override_memory is None else override_memory,
             swap_total=sm.total,
             swap_available=sm.free,
+            gpu_vram_total=gpu_vram_total,
+            gpu_vram_available=gpu_vram_available,
+            gpu_vram_used=gpu_vram_used,
         )
 
 
