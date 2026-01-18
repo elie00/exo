@@ -457,19 +457,406 @@ class HeterogeneousCluster:
 # =============================================================================
 
 
+# =============================================================================
+# Network-Based Distributed Inference
+# =============================================================================
+
+
+@dataclass
+class InferenceRequest:
+    """Request for distributed inference."""
+    request_id: str
+    prompt: str
+    max_tokens: int = 256
+    temperature: float = 0.7
+    stream: bool = True
+
+
+@dataclass
+class InferenceResponse:
+    """Response from distributed inference."""
+    request_id: str
+    token: str
+    done: bool = False
+    error: str | None = None
+
+
+class GGUFInferenceServer:
+    """TCP server for remote GGUF inference.
+    
+    This server runs on a node and accepts inference requests from other nodes.
+    It allows heterogeneous nodes (Mac/Dell) to participate in distributed inference.
+    """
+    
+    def __init__(
+        self,
+        node: GGUFInferenceNode,
+        host: str = "0.0.0.0",
+        port: int = 50100,
+    ):
+        self.node = node
+        self.host = host
+        self.port = port
+        self._server: asyncio.Server | None = None
+        self._running = False
+    
+    async def start(self) -> None:
+        """Start the inference server."""
+        if not self.node.is_loaded:
+            await self.node.load_model()
+        
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            self.host,
+            self.port,
+        )
+        self._running = True
+        
+        logger.info(f"GGUF Inference Server started on {self.host}:{self.port}")
+        logger.info(f"  Node: {self.node.node_id} ({self.node.backend.value})")
+    
+    async def serve_forever(self) -> None:
+        """Serve requests until stopped."""
+        if self._server is None:
+            await self.start()
+        
+        assert self._server is not None
+        async with self._server:
+            await self._server.serve_forever()
+    
+    async def stop(self) -> None:
+        """Stop the server."""
+        self._running = False
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+    
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle a client connection."""
+        addr = writer.get_extra_info("peername")
+        logger.debug(f"Client connected from {addr}")
+        
+        try:
+            while True:
+                # Read request length (4 bytes, big-endian)
+                length_bytes = await reader.readexactly(4)
+                length = struct.unpack(">I", length_bytes)[0]
+                
+                # Read request JSON
+                request_bytes = await reader.readexactly(length)
+                request_data = json.loads(request_bytes.decode("utf-8"))
+                
+                request = InferenceRequest(
+                    request_id=request_data["request_id"],
+                    prompt=request_data["prompt"],
+                    max_tokens=request_data.get("max_tokens", 256),
+                    temperature=request_data.get("temperature", 0.7),
+                    stream=request_data.get("stream", True),
+                )
+                
+                logger.debug(f"Received request {request.request_id}")
+                
+                # Generate response
+                try:
+                    async for token in self.node.generate(
+                        request.prompt,
+                        max_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                    ):
+                        response = InferenceResponse(
+                            request_id=request.request_id,
+                            token=token,
+                            done=False,
+                        )
+                        await self._send_response(writer, response)
+                    
+                    # Send final response
+                    response = InferenceResponse(
+                        request_id=request.request_id,
+                        token="",
+                        done=True,
+                    )
+                    await self._send_response(writer, response)
+                    
+                except Exception as e:
+                    logger.error(f"Generation error: {e}")
+                    response = InferenceResponse(
+                        request_id=request.request_id,
+                        token="",
+                        done=True,
+                        error=str(e),
+                    )
+                    await self._send_response(writer, response)
+        
+        except asyncio.IncompleteReadError:
+            logger.debug(f"Client {addr} disconnected")
+        except Exception as e:
+            logger.error(f"Client handler error: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    
+    async def _send_response(
+        self,
+        writer: asyncio.StreamWriter,
+        response: InferenceResponse,
+    ) -> None:
+        """Send a response to the client."""
+        response_data = {
+            "request_id": response.request_id,
+            "token": response.token,
+            "done": response.done,
+            "error": response.error,
+        }
+        response_bytes = json.dumps(response_data).encode("utf-8")
+        
+        # Send length + data
+        writer.write(struct.pack(">I", len(response_bytes)))
+        writer.write(response_bytes)
+        await writer.drain()
+
+
+class GGUFInferenceClient:
+    """TCP client for remote GGUF inference.
+    
+    This client connects to a remote GGUFInferenceServer and sends
+    inference requests.
+    """
+    
+    def __init__(self, host: str, port: int = 50100):
+        self.host = host
+        self.port = port
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._connected = False
+        self._request_counter = 0
+    
+    async def connect(self) -> None:
+        """Connect to the remote server."""
+        self._reader, self._writer = await asyncio.open_connection(
+            self.host, self.port
+        )
+        self._connected = True
+        logger.info(f"Connected to GGUF server at {self.host}:{self.port}")
+    
+    async def disconnect(self) -> None:
+        """Disconnect from the server."""
+        if self._writer:
+            self._writer.close()
+            await self._writer.wait_closed()
+        self._connected = False
+    
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[str]:
+        """Generate text using the remote server."""
+        if not self._connected:
+            await self.connect()
+        
+        assert self._reader is not None
+        assert self._writer is not None
+        
+        self._request_counter += 1
+        request_id = f"req-{self._request_counter}"
+        
+        # Send request
+        request_data = {
+            "request_id": request_id,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+        request_bytes = json.dumps(request_data).encode("utf-8")
+        
+        self._writer.write(struct.pack(">I", len(request_bytes)))
+        self._writer.write(request_bytes)
+        await self._writer.drain()
+        
+        # Read responses
+        while True:
+            length_bytes = await self._reader.readexactly(4)
+            length = struct.unpack(">I", length_bytes)[0]
+            
+            response_bytes = await self._reader.readexactly(length)
+            response_data = json.loads(response_bytes.decode("utf-8"))
+            
+            if response_data.get("error"):
+                raise RuntimeError(response_data["error"])
+            
+            if response_data["token"]:
+                yield response_data["token"]
+            
+            if response_data["done"]:
+                break
+
+
+@dataclass
+class RemoteNode:
+    """A remote inference node accessed via TCP."""
+    node_id: str
+    host: str
+    port: int = 50100
+    client: GGUFInferenceClient | None = None
+    
+    async def connect(self) -> None:
+        """Connect to the remote node."""
+        self.client = GGUFInferenceClient(self.host, self.port)
+        await self.client.connect()
+    
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[str]:
+        """Generate text using the remote node."""
+        if self.client is None:
+            await self.connect()
+        assert self.client is not None
+        
+        async for token in self.client.generate(prompt, max_tokens, temperature):
+            yield token
+    
+    async def disconnect(self) -> None:
+        """Disconnect from the remote node."""
+        if self.client:
+            await self.client.disconnect()
+
+
+@dataclass
+class NetworkedHeterogeneousCluster:
+    """A heterogeneous cluster with both local and remote nodes.
+    
+    This class coordinates inference across:
+    - Local nodes (direct llama-cpp-python access)
+    - Remote nodes (accessed via TCP)
+    
+    Example:
+        # Create cluster
+        cluster = NetworkedHeterogeneousCluster()
+        
+        # Add local node (Mac with Metal)
+        local_node = GGUFInferenceNode("mac", config)
+        await local_node.load_model()
+        cluster.add_local_node(local_node)
+        
+        # Add remote node (Dell with CUDA)
+        cluster.add_remote_node("dell", "100.101.73.105", 50100)
+        await cluster.connect_remote_nodes()
+        
+        # Generate using best available node
+        async for token in cluster.generate("Hello!"):
+            print(token, end="")
+    """
+    
+    local_nodes: list[GGUFInferenceNode] = field(default_factory=list)
+    remote_nodes: list[RemoteNode] = field(default_factory=list)
+    current_idx: int = 0
+    
+    def add_local_node(self, node: GGUFInferenceNode) -> None:
+        """Add a local inference node."""
+        self.local_nodes.append(node)
+        logger.info(f"Added local node: {node.node_id} ({node.backend.value})")
+    
+    def add_remote_node(self, node_id: str, host: str, port: int = 50100) -> None:
+        """Add a remote inference node."""
+        self.remote_nodes.append(RemoteNode(node_id, host, port))
+        logger.info(f"Added remote node: {node_id} at {host}:{port}")
+    
+    async def connect_remote_nodes(self) -> None:
+        """Connect to all remote nodes."""
+        for node in self.remote_nodes:
+            try:
+                await node.connect()
+            except Exception as e:
+                logger.warning(f"Failed to connect to {node.node_id}: {e}")
+    
+    @property
+    def total_nodes(self) -> int:
+        return len(self.local_nodes) + len(self.remote_nodes)
+    
+    def _get_next_node(self) -> GGUFInferenceNode | RemoteNode:
+        """Get the next node using round-robin."""
+        all_nodes: list[GGUFInferenceNode | RemoteNode] = [
+            *self.local_nodes,
+            *self.remote_nodes,
+        ]
+        node = all_nodes[self.current_idx % len(all_nodes)]
+        self.current_idx += 1
+        return node
+    
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[str]:
+        """Generate using load-balanced node selection."""
+        node = self._get_next_node()
+        
+        if isinstance(node, GGUFInferenceNode):
+            logger.debug(f"Using local node: {node.node_id}")
+            async for token in node.generate(prompt, max_tokens, temperature):
+                yield token
+        else:
+            logger.debug(f"Using remote node: {node.node_id}")
+            async for token in node.generate(prompt, max_tokens, temperature):
+                yield token
+    
+    async def shutdown(self) -> None:
+        """Shutdown all nodes."""
+        for node in self.local_nodes:
+            node.unload()
+        for node in self.remote_nodes:
+            await node.disconnect()
+
+
 async def test_heterogeneous_inference():
     """Test heterogeneous inference on the local node."""
-    # Detect capabilities
     caps = NodeCapabilities.detect("local")
     print(f"Node capabilities: {caps}")
+
+
+def run_inference_server():
+    """CLI entry point for running an inference server."""
+    import argparse
     
-    # This would need a real GGUF model path
-    # config = GGUFModelConfig(model_path=Path("model.gguf"))
-    # node = GGUFInferenceNode("local", config)
-    # await node.load_model()
-    # 
-    # async for token in node.generate("Hello, "):
-    #     print(token, end="", flush=True)
+    parser = argparse.ArgumentParser(description="Run GGUF inference server")
+    parser.add_argument("--model", "-m", required=True, help="Path to GGUF model")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
+    parser.add_argument("--port", "-p", type=int, default=50100, help="Port to bind")
+    parser.add_argument("--n-ctx", type=int, default=2048, help="Context length")
+    parser.add_argument("--n-gpu-layers", type=int, default=-1, help="GPU layers (-1=all)")
+    
+    args = parser.parse_args()
+    
+    async def main():
+        config = GGUFModelConfig(
+            model_path=Path(args.model),
+            n_ctx=args.n_ctx,
+            n_gpu_layers=args.n_gpu_layers,
+        )
+        
+        caps = NodeCapabilities.detect("server")
+        node = GGUFInferenceNode(f"server-{caps.backend.value}", config)
+        server = GGUFInferenceServer(node, args.host, args.port)
+        
+        print(f"Starting GGUF Inference Server")
+        print(f"  Model: {args.model}")
+        print(f"  Backend: {caps.backend.value}")
+        print(f"  Address: {args.host}:{args.port}")
+        
+        await server.serve_forever()
+    
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
