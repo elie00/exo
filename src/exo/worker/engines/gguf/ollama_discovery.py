@@ -237,10 +237,33 @@ def discover_ollama_models() -> list[OllamaModel]:
                 continue
     
     
-    # Also scan for local GGUF files in ~/exo/models
+    # Scan for local GGUF files in multiple directories
     try:
-        local_models_dir = Path.home() / "exo" / "models"
-        if local_models_dir.exists():
+        # Build list of directories to scan for local GGUF models
+        local_model_dirs: list[Path] = [
+            Path.home() / "exo" / "models",  # Default user dir
+        ]
+        
+        # Add /mnt/models on Linux (common for attached storage)
+        if platform.system() == "Linux":
+            mnt_models = Path("/mnt/models")
+            if mnt_models.exists():
+                local_model_dirs.append(mnt_models)
+        
+        # Add custom paths from environment variable (colon-separated)
+        if "EXO_GGUF_MODELS_PATH" in os.environ:
+            for path in os.environ["EXO_GGUF_MODELS_PATH"].split(":"):
+                custom_path = Path(path.strip())
+                if custom_path.exists() and custom_path not in local_model_dirs:
+                    local_model_dirs.append(custom_path)
+        
+        # Scan all directories for GGUF files
+        for local_models_dir in local_model_dirs:
+            if not local_models_dir.exists():
+                continue
+                
+            logger.debug(f"Scanning for local GGUF models in: {local_models_dir}")
+            
             for file_path in local_models_dir.glob("*.gguf"):
                 if not file_path.is_file():
                     continue
@@ -258,6 +281,7 @@ def discover_ollama_models() -> list[OllamaModel]:
                 )
                 models.append(model)
                 logger.info(f"Discovered Local GGUF model: {model.full_name} ({model.size_gb:.1f} GB)")
+                
     except Exception as e:
         logger.error(f"Error scanning local GGUF models: {e}")
 
