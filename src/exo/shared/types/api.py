@@ -4,14 +4,26 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 from pydantic_core import PydanticUseDefault
 
+from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.common import CommandId
-from exo.shared.types.models import ModelId, ModelMetadata
+from exo.shared.types.memory import Memory
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
 from exo.shared.types.worker.shards import Sharding
 
 FinishReason = Literal[
-    "stop", "length", "tool_calls", "content_filter", "function_call"
+    "stop", "length", "tool_calls", "content_filter", "function_call", "error"
 ]
+
+
+class ErrorInfo(BaseModel):
+    message: str
+    type: str
+    param: str | None = None
+    code: int
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorInfo
 
 
 class ModelListModel(BaseModel):
@@ -49,6 +61,10 @@ class ChatCompletionMessage(BaseModel):
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
     function_call: dict[str, Any] | None = None
+
+
+class BenchChatCompletionMessage(ChatCompletionMessage):
+    pass
 
 
 class TopLogprobItem(BaseModel):
@@ -113,6 +129,18 @@ class ChatCompletionResponse(BaseModel):
     service_tier: str | None = None
 
 
+class GenerationStats(BaseModel):
+    prompt_tps: float
+    generation_tps: float
+    prompt_tokens: int
+    generation_tokens: int
+    peak_memory_usage: Memory
+
+
+class BenchChatCompletionResponse(ChatCompletionResponse):
+    generation_stats: GenerationStats | None = None
+
+
 class ChatCompletionTaskParams(BaseModel):
     model: str
     frequency_penalty: float | None = None
@@ -133,6 +161,10 @@ class ChatCompletionTaskParams(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+
+
+class BenchChatCompletionTaskParams(ChatCompletionTaskParams):
+    pass
 
 
 class PlaceInstanceParams(BaseModel):
@@ -175,7 +207,7 @@ class DeleteInstanceTaskParams(BaseModel):
 class CreateInstanceResponse(BaseModel):
     message: str
     command_id: CommandId
-    model_meta: ModelMetadata
+    model_card: ModelCard
 
 
 class DeleteInstanceResponse(BaseModel):

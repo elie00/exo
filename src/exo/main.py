@@ -1,5 +1,7 @@
 import argparse
 import multiprocessing as mp
+import os
+import resource
 import signal
 from dataclasses import dataclass, field
 from typing import Self
@@ -27,7 +29,7 @@ from exo.worker.main import Worker
 @dataclass
 class Node:
     router: Router
-    worker: Worker
+    worker: Worker | None
     election: Election  # Every node participates in election, as we do want a node to become master even if it isn't a master candidate if no master candidates are present.
     election_result_receiver: Receiver[ElectionResult]
     master: Master | None
@@ -61,15 +63,19 @@ class Node:
         else:
             api = None
 
-        worker = Worker(
-            node_id,
-            session_id,
-            exo_shard_downloader(),
-            connection_message_receiver=router.receiver(topics.CONNECTION_MESSAGES),
-            global_event_receiver=router.receiver(topics.GLOBAL_EVENTS),
-            local_event_sender=router.sender(topics.LOCAL_EVENTS),
-            command_sender=router.sender(topics.COMMANDS),
-        )
+        if not args.no_worker:
+            worker = Worker(
+                node_id,
+                session_id,
+                exo_shard_downloader(),
+                connection_message_receiver=router.receiver(topics.CONNECTION_MESSAGES),
+                global_event_receiver=router.receiver(topics.GLOBAL_EVENTS),
+                local_event_sender=router.sender(topics.LOCAL_EVENTS),
+                command_sender=router.sender(topics.COMMANDS),
+            )
+        else:
+            worker = None
+
         # We start every node with a master
         master = Master(
             node_id,
@@ -99,8 +105,9 @@ class Node:
         async with self._tg as tg:
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
             tg.start_soon(self.router.run)
-            tg.start_soon(self.worker.run)
             tg.start_soon(self.election.run)
+            if self.worker:
+                tg.start_soon(self.worker.run)
             if self.master:
                 tg.start_soon(self.master.run)
             if self.api:
@@ -189,6 +196,8 @@ class Node:
 
 def main():
     args = Args.parse()
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 65535), hard))
 
     try:
         mp.set_start_method("spawn")
@@ -197,6 +206,15 @@ def main():
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
     logger.info("Starting EXO")
+    logger.info(f"EXO_LIBP2P_NAMESPACE: {os.getenv('EXO_LIBP2P_NAMESPACE')}")
+
+    # Set FAST_SYNCH override env var for runner subprocesses
+    if args.fast_synch is True:
+        os.environ["EXO_FAST_SYNCH"] = "on"
+        logger.info("FAST_SYNCH forced ON")
+    elif args.fast_synch is False:
+        os.environ["EXO_FAST_SYNCH"] = "off"
+        logger.info("FAST_SYNCH forced OFF")
 
     node = anyio.run(Node.create, args)
     anyio.run(node.run)
@@ -210,6 +228,8 @@ class Args(CamelCaseModel):
     spawn_api: bool = False
     api_port: PositiveInt = 52415
     tb_only: bool = False
+    no_worker: bool = False
+    fast_synch: bool | None = None  # None = auto, True = force on, False = force off
 
     @classmethod
     def parse(cls) -> Self:
@@ -246,6 +266,24 @@ class Args(CamelCaseModel):
             type=int,
             dest="api_port",
             default=52415,
+        )
+        parser.add_argument(
+            "--no-worker",
+            action="store_true",
+        )
+        fast_synch_group = parser.add_mutually_exclusive_group()
+        fast_synch_group.add_argument(
+            "--fast-synch",
+            action="store_true",
+            dest="fast_synch",
+            default=None,
+            help="Force MLX FAST_SYNCH on (for JACCL backend)",
+        )
+        fast_synch_group.add_argument(
+            "--no-fast-synch",
+            action="store_false",
+            dest="fast_synch",
+            help="Force MLX FAST_SYNCH off",
         )
 
         args = parser.parse_args()

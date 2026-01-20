@@ -1,14 +1,26 @@
 import json
 import os
-import platform
 import resource
+import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Literal, cast
+from typing import Any, cast
+
+# Monkey-patch for transformers 5.x compatibility
+# Kimi's tokenization_kimi.py imports bytes_to_unicode from the old location
+# which was moved in transformers 5.0.0rc2
+try:
+    import transformers.models.gpt2.tokenization_gpt2 as gpt2_tokenization
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    if not hasattr(gpt2_tokenization, "bytes_to_unicode"):
+        gpt2_tokenization.bytes_to_unicode = bytes_to_unicode  # type: ignore[attr-defined]
+except ImportError:
+    pass  # transformers < 5.0 or bytes_to_unicode not available
 
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.worker.engines.mlx.constants import (
@@ -20,7 +32,7 @@ from exo.worker.engines.mlx.constants import (
 try:
     from mlx_lm.tokenizer_utils import load_tokenizer
 except ImportError:
-    from mlx_lm.tokenizer_utils import load as load_tokenizer  # type: ignore
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
 import contextlib
 
 import mlx.core as mx
@@ -45,6 +57,8 @@ from exo.shared.types.worker.shards import (
 from exo.worker.download.download_utils import build_model_path
 from exo.worker.engines.mlx import Model
 from exo.worker.engines.mlx.auto_parallel import (
+    TimeoutCallback,
+    eval_with_timeout,
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
@@ -55,122 +69,23 @@ Group = mx.distributed.Group
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
 
-# --- Device Detection and Configuration ---
-
-MlxDeviceType = Literal["metal", "cuda", "cpu"]
-
-
-def _detect_mlx_device() -> MlxDeviceType:
-    """
-    Detect the best available MLX device.
-
-    Priority:
-    1. Apple Metal (macOS with Apple Silicon)
-    2. NVIDIA CUDA (Linux with NVIDIA GPU and MLX CUDA support)
-    3. CPU fallback
-
-    Returns:
-        The device type string: "metal", "cuda", or "cpu"
-    """
-    system = platform.system().lower()
-
-    # Check for Apple Metal (macOS)
-    if system == "darwin" and mx.metal.is_available():
-        return "metal"
-
-    # Check for NVIDIA CUDA (Linux)
-    if system == "linux":
-        # Check if MLX has CUDA support
-        if hasattr(mx, "cuda") and hasattr(mx.cuda, "is_available"):
-            try:
-                if mx.cuda.is_available():  # type: ignore[attr-defined]
-                    return "cuda"
-            except Exception as e:
-                logger.debug(f"CUDA detection failed: {e}")
-
-    # Fallback to CPU
-    return "cpu"
-
-
-def _configure_mlx_device(device_type: MlxDeviceType) -> None:
-    """
-    Configure MLX to use the specified device.
-
-    Args:
-        device_type: The device type to configure ("metal", "cuda", or "cpu")
-    """
-    match device_type:
-        case "metal":
-            mx.set_default_device(mx.gpu)
-            logger.info("MLX configured to use Apple Metal GPU")
-        case "cuda":
-            # MLX CUDA uses mx.gpu as the device type
-            mx.set_default_device(mx.gpu)
-            logger.info("MLX configured to use NVIDIA CUDA GPU")
-        case "cpu":
-            mx.set_default_device(mx.cpu)
-            logger.info("MLX configured to use CPU (no GPU acceleration)")
-
-
-def get_mlx_device_info() -> dict[str, str | int | bool]:
-    """
-    Get information about the current MLX device configuration.
-
-    Returns:
-        Dictionary with device information including type, name, and memory.
-    """
-    device_type = _detect_mlx_device()
-    info: dict[str, str | int | bool] = {
-        "device_type": device_type,
-        "platform": platform.system(),
-    }
-
-    if device_type == "metal" and mx.metal.is_available():
-        device_info = mx.metal.device_info()
-        info["device_name"] = str(device_info.get("device_name", "Unknown"))
-        info["max_recommended_memory"] = int(
-            device_info.get("max_recommended_working_set_size", 0)
-        )
-        info["metal_available"] = True
-
-    elif device_type == "cuda":
-        info["cuda_available"] = True
-        # Try to get NVIDIA GPU info via pynvml if available
-        try:
-            from exo.worker.utils.nvidia_monitor import get_metrics, is_nvidia_available
-
-            if is_nvidia_available():
-                metrics = get_metrics()
-                info["gpu_count"] = metrics.gpu_count
-                info["driver_version"] = metrics.driver_version
-                info["cuda_version"] = metrics.cuda_version
-                info["gpu_memory_total_mb"] = metrics.gpu_memory_total_mb
-                if metrics.gpus:
-                    info["device_name"] = metrics.gpus[0].name
-        except ImportError:
-            logger.debug("pynvml not available for CUDA device info")
-        except Exception as e:
-            logger.debug(f"Failed to get NVIDIA GPU info: {e}")
-
-    else:
-        info["cpu_only"] = True
-
-    return info
-
-
 # TODO: Test this
 #  ALSO https://github.com/exo-explore/exo/pull/233#discussion_r2549683673
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
     return Memory.from_float_kb(
         (model_shard_meta.end_layer - model_shard_meta.start_layer)
         / model_shard_meta.n_layers
-        * model_shard_meta.model_meta.storage_size.in_kb
+        * model_shard_meta.model_card.storage_size.in_kb
         / (
             1
             if isinstance(model_shard_meta, PipelineShardMetadata)
             else model_shard_meta.world_size
         )
     )
+
+
+class ModelLoadingTimeoutError(Exception):
+    pass
 
 
 def mx_barrier(group: Group | None = None):
@@ -236,22 +151,28 @@ def mlx_distributed_init(
                 group = mx.distributed.init(backend="ring", strict=True)
 
             case MlxJacclInstance(
-                ibv_devices=ibv_devices, jaccl_coordinators=jaccl_coordinators
+                jaccl_devices=jaccl_devices, jaccl_coordinators=jaccl_coordinators
             ):
+                assert all(
+                    jaccl_devices[i][i] is None for i in range(len(jaccl_devices))
+                )
                 # Use RDMA connectivity matrix
                 coordination_file = (
                     f"./hosts_{bound_instance.instance.instance_id}_{rank}.json"
                 )
-                ibv_devices_json = json.dumps(ibv_devices)
+                jaccl_devices_json = json.dumps(jaccl_devices)
 
                 with open(coordination_file, "w") as f:
-                    _ = f.write(ibv_devices_json)
+                    _ = f.write(jaccl_devices_json)
 
                 jaccl_coordinator = jaccl_coordinators[bound_instance.bound_node_id]
 
-                logger.info(f"rank {rank} MLX_IBV_DEVICES: {ibv_devices_json}")
+                # TODO: update once upstream fixes
+                logger.info(
+                    f"rank {rank} MLX_JACCL_DEVICES: {coordination_file} with devices: {jaccl_devices_json}"
+                )
                 logger.info(f"rank {rank} MLX_JACCL_COORDINATOR: {jaccl_coordinator}")
-                os.environ["MLX_IBV_DEVICES"] = coordination_file
+                os.environ["MLX_JACCL_DEVICES"] = coordination_file
                 os.environ["MLX_RANK"] = str(rank)
                 os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
                 group = mx.distributed.init(backend="jaccl", strict=True)
@@ -268,14 +189,6 @@ def mlx_distributed_init(
 def initialize_mlx(
     bound_instance: BoundInstance,
 ) -> Group:
-    # Configure MLX device based on available hardware
-    device_type = _detect_mlx_device()
-    _configure_mlx_device(device_type)
-
-    # Log device info at startup
-    device_info = get_mlx_device_info()
-    logger.info(f"MLX device info: {device_info}")
-
     # should we unseed it?
     # TODO: pass in seed from params
     mx.random.seed(42)
@@ -287,15 +200,13 @@ def initialize_mlx(
 
 
 def load_mlx_items(
-    bound_instance: BoundInstance, group: Group | None
-) -> tuple[Model, TokenizerWrapper, Callable[[mx.array], mx.array]]:
-    # TODO: pass temperature
-    sampler: Callable[[mx.array], mx.array] = make_sampler(temp=0.7)
-    logger.info("Created a sampler")
-
+    bound_instance: BoundInstance,
+    group: Group | None,
+    on_timeout: TimeoutCallback | None = None,
+) -> tuple[Model, TokenizerWrapper]:
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
-        model_path = build_model_path(bound_instance.bound_shard.model_meta.model_id)
+        model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
         model, _ = load_model(model_path, strict=True)
         end_time = time.perf_counter()
@@ -305,7 +216,9 @@ def load_mlx_items(
     else:
         logger.info("Starting distributed init")
         start_time = time.perf_counter()
-        model, tokenizer = shard_and_load(bound_instance.bound_shard, group=group)
+        model, tokenizer = shard_and_load(
+            bound_instance.bound_shard, group=group, on_timeout=on_timeout
+        )
         end_time = time.perf_counter()
         logger.info(
             f"Time taken to shard and load model: {(end_time - start_time):.2f}s"
@@ -313,14 +226,15 @@ def load_mlx_items(
 
     set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
 
-    return cast(Model, model), tokenizer, sampler
+    return cast(Model, model), tokenizer
 
 
 def shard_and_load(
     shard_metadata: ShardMetadata,
     group: Group,
+    on_timeout: TimeoutCallback | None = None,
 ) -> tuple[nn.Module, TokenizerWrapper]:
-    model_path = build_model_path(shard_metadata.model_meta.model_id)
+    model_path = build_model_path(shard_metadata.model_card.model_id)
 
     model, _ = load_model(model_path, lazy=True, strict=False)
     logger.debug(model)
@@ -347,15 +261,23 @@ def shard_and_load(
 
     logger.info(f"Group size: {group.size()}, group rank: {group.rank()}")
 
+    # Estimate timeout based on model size
+    base_timeout = float(os.environ.get("EXO_MODEL_LOAD_TIMEOUT", "60"))
+    model_size_gb = get_weights_size(shard_metadata).in_bytes / (1024**3)
+    timeout_seconds = base_timeout + model_size_gb / 5
+    logger.info(
+        f"Evaluating model parameters with timeout of {timeout_seconds:.0f}s "
+        f"(model size: {model_size_gb:.1f}GB)"
+    )
+
     match shard_metadata:
         case TensorShardMetadata():
             logger.info(f"loading model from {model_path} with tensor parallelism")
-            model = tensor_auto_parallel(model, group)
+            model = tensor_auto_parallel(model, group, timeout_seconds, on_timeout)
         case PipelineShardMetadata():
             logger.info(f"loading model from {model_path} with pipeline parallelism")
             model = pipeline_auto_parallel(model, group, shard_metadata)
-
-    mx.eval(model.parameters())
+            eval_with_timeout(model.parameters(), timeout_seconds, on_timeout)
 
     # TODO: Do we need this?
     mx.eval(model)
@@ -369,26 +291,73 @@ def shard_and_load(
     return model, tokenizer
 
 
-def get_tokenizer(model_path: Path, shard_metadata: ShardMetadata):
-    # TODO: Let's move away from this custom logic to mlx_lm.load()
-    if "kimi-k2" in shard_metadata.model_meta.model_id.lower():
-        eos_token_ids = [163586]
+def get_tokenizer(model_path: Path, shard_metadata: ShardMetadata) -> TokenizerWrapper:
+    """Load tokenizer for a model shard. Delegates to load_tokenizer_for_model_id."""
+    return load_tokenizer_for_model_id(shard_metadata.model_card.model_id, model_path)
 
-    elif "glm" in shard_metadata.model_meta.model_id.lower():
-        eos_token_ids = [151336, 151329, 151338]
 
-    else:
-        eos_token_ids = None
+def get_eos_token_ids_for_model(model_id: str) -> list[int] | None:
+    """
+    Get the EOS token IDs for a model based on its ID.
 
-    tokenizer = cast(
-        TokenizerWrapper,
-        load_tokenizer(
-            model_path,
-            tokenizer_config_extra={"trust_remote_code": TRUST_REMOTE_CODE},
-            eos_token_ids=eos_token_ids,
-        ),
+    Some models require explicit EOS token configuration that isn't in their
+    tokenizer config. This function returns the known EOS token IDs for such models.
+
+    Args:
+        model_id: The HuggingFace model ID
+
+    Returns:
+        List of EOS token IDs, or None if the model uses standard tokenizer config
+    """
+    model_id_lower = model_id.lower()
+    if "kimi-k2" in model_id_lower:
+        return [163586]
+    elif "glm-4.7-flash" in model_id_lower:
+        # 154820: <|endoftext|>, 154827: <|user|>, 154829: <|observation|>
+        return [154820, 154827, 154829]
+    elif "glm" in model_id_lower:
+        return [151336, 151329, 151338]
+    return None
+
+
+def load_tokenizer_for_model_id(model_id: str, model_path: Path) -> TokenizerWrapper:
+    """
+    Load tokenizer for a model given its ID and local path.
+
+    This is the core tokenizer loading logic, handling special cases for different
+    model families (Kimi, GLM, etc.) and transformers 5.x compatibility.
+
+    Args:
+        model_id: The HuggingFace model ID (e.g., "moonshotai/Kimi-K2-Instruct")
+        model_path: Local path where the model/tokenizer files are stored
+
+    Returns:
+        TokenizerWrapper instance configured for the model
+    """
+    model_id_lower = model_id.lower()
+    eos_token_ids = get_eos_token_ids_for_model(model_id)
+
+    # Kimi uses a custom TikTokenTokenizer that transformers 5.x can't load via AutoTokenizer
+    if "kimi-k2" in model_id_lower:
+        sys.path.insert(0, str(model_path))
+        from tokenization_kimi import TikTokenTokenizer  # type: ignore[import-not-found]  # noqa: I001
+
+        hf_tokenizer: Any = TikTokenTokenizer.from_pretrained(model_path)  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
+
+        # Patch encode to use internal tiktoken model directly
+        # transformers 5.x has a bug in the encode->pad path for slow tokenizers
+        def _patched_encode(text: str, **_kwargs: object) -> list[int]:
+            # Pass allowed_special="all" to handle special tokens like <|im_user|>
+            return list(hf_tokenizer.model.encode(text, allowed_special="all"))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+
+        hf_tokenizer.encode = _patched_encode
+        return TokenizerWrapper(hf_tokenizer, eos_token_ids=eos_token_ids)
+
+    tokenizer = load_tokenizer(
+        model_path,
+        tokenizer_config_extra={"trust_remote_code": TRUST_REMOTE_CODE},
+        eos_token_ids=eos_token_ids,
     )
-    assert isinstance(tokenizer, TokenizerWrapper)
 
     return tokenizer
 
@@ -401,15 +370,15 @@ def apply_chat_template(
     messages = chat_task_data.messages
 
     formatted_messages: list[dict[str, Any]] = []
-    for _, message in enumerate(messages):
+    for message in messages:
         if isinstance(message.content, ChatCompletionMessageText):
             message.content = message.content.text
         if isinstance(message.content, list):
-            if len(message.content) != 1:
-                logger.warning("Received malformed prompt")
+            if len(message.content) == 0:
+                logger.warning("Received prompt with no content, skipping")
                 continue
 
-            message.content = message.content[0].text
+            message.content = "\n".join(c.text for c in message.content).strip()
         if message.content is None and message.thinking is None:
             continue
 
@@ -418,13 +387,26 @@ def apply_chat_template(
             {k: v for k, v in message.model_dump().items() if v is not None}  # type: ignore
         )
 
-    prompt: str = tokenizer.apply_chat_template(  # type: ignore
+    prompt: str = tokenizer.apply_chat_template(
         formatted_messages,
         tokenize=False,
         add_generation_prompt=True,
+        tools=chat_task_data.tools,
     )
 
-    return prompt  # type: ignore
+    logger.info(prompt)
+
+    return prompt
+
+
+def detect_thinking_prompt_suffix(prompt: str, tokenizer: TokenizerWrapper) -> bool:
+    """
+    Detect if prompt ends with a thinking opening tag that should be
+    prepended to the output stream.
+    """
+    think_token = tokenizer.think_start
+
+    return think_token is not None and prompt.rstrip().endswith(think_token)
 
 
 class NullKVCache(KVCache):
@@ -454,6 +436,11 @@ def make_kv_cache(
     model: Model, max_kv_size: int | None = None, keep: int = 0
 ) -> list[KVCache | RotatingKVCache | QuantizedKVCache]:
     assert hasattr(model, "layers")
+
+    # TODO: Do this for all models
+    if hasattr(model, "make_cache") and isinstance(model, GptOssModel):
+        logger.info("Using MLX LM's make cache")
+        return model.make_cache()  # type: ignore
 
     if max_kv_size is None:
         if KV_CACHE_BITS is None:
@@ -507,11 +494,15 @@ def set_wired_limit_for_model(model_size: Memory):
             "MB. This can be slow. See the documentation for possible work-arounds: "
             "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
         )
-    kv_bytes = int(0.02 * model_bytes)
-    target_cache = int(1.10 * (model_bytes + kv_bytes))
-    target_cache = min(target_cache, max_rec_size)
-    mx.set_cache_limit(target_cache)
     mx.set_wired_limit(max_rec_size)
-    logger.info(
-        f"Wired limit set to {max_rec_size}. Cache limit set to {target_cache}."
-    )
+    logger.info(f"Wired limit set to {max_rec_size}.")
+
+
+def mlx_cleanup(
+    model: Model | None, tokenizer: TokenizerWrapper | None, group: Group | None
+) -> None:
+    del model, tokenizer, group
+    mx.clear_cache()
+    import gc
+
+    gc.collect()

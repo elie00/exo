@@ -98,7 +98,7 @@
 		const shardData = shardObj[shardKeys[0]] as Record<string, unknown>;
 		if (!shardData) return null;
 
-		const modelMeta = shardData.model_meta ?? shardData.modelMeta;
+		const modelMeta = shardData.model_card ?? shardData.modelCard;
 		if (!modelMeta || typeof modelMeta !== 'object') return null;
 
 		const meta = modelMeta as Record<string, unknown>;
@@ -190,7 +190,7 @@
 						const shardKeys = Object.keys(shardObj);
 						if (shardKeys.length !== 1) return null;
 						const shardData = shardObj[shardKeys[0]] as Record<string, unknown>;
-						const modelMeta = shardData?.model_meta ?? shardData?.modelMeta;
+						const modelMeta = shardData?.model_card ?? shardData?.modelCard;
 						if (!modelMeta || typeof modelMeta !== 'object') return null;
 						const meta = modelMeta as Record<string, unknown>;
 						return (meta.prettyName as string) ?? null;
@@ -199,7 +199,13 @@
 					const rawProgress = (downloadPayload as Record<string, unknown>).download_progress
 						?? (downloadPayload as Record<string, unknown>).downloadProgress
 						?? {};
-					const totalBytes = getBytes((rawProgress as Record<string, unknown>).total_bytes ?? (rawProgress as Record<string, unknown>).totalBytes);
+					// For DownloadCompleted, total_bytes is at top level; for DownloadOngoing, it's inside download_progress
+					const totalBytes = getBytes(
+						(downloadPayload as Record<string, unknown>).total_bytes
+						?? (downloadPayload as Record<string, unknown>).totalBytes
+						?? (rawProgress as Record<string, unknown>).total_bytes
+						?? (rawProgress as Record<string, unknown>).totalBytes
+					);
 					const downloadedBytes = getBytes((rawProgress as Record<string, unknown>).downloaded_bytes ?? (rawProgress as Record<string, unknown>).downloadedBytes);
 					const speed = (rawProgress as Record<string, unknown>).speed as number ?? 0;
 					const etaMs = (rawProgress as Record<string, unknown>).eta_ms as number ?? (rawProgress as Record<string, unknown>).etaMs as number ?? 0;
@@ -332,8 +338,13 @@
 								<div class="text-lg font-mono text-white truncate">{node.nodeName}</div>
 								<div class="text-xs text-exo-light-gray font-mono truncate">{node.nodeId}</div>
 							</div>
-							<div class="text-xs font-mono uppercase tracking-wider whitespace-nowrap shrink-0">
-								<span class="text-green-400">{node.models.filter(m => m.status === 'completed').length}</span><span class="text-exo-yellow"> /{node.models.length} models</span>
+							<div class="text-xs font-mono uppercase tracking-wider whitespace-nowrap shrink-0 text-right">
+								<div>
+									<span class="text-green-400">{node.models.filter(m => m.status === 'completed').length}</span><span class="text-exo-yellow"> / {node.models.length} models</span>
+								</div>
+								<div class="text-exo-light-gray normal-case tracking-normal">
+									{formatBytes(node.models.filter(m => m.status === 'completed').reduce((sum, m) => sum + m.totalBytes, 0))} on disk
+								</div>
 							</div>
 						</div>
 
@@ -385,7 +396,7 @@
 								</div>
 
 								<div class="flex items-center justify-between text-xs font-mono text-exo-light-gray">
-									<span>{model.status === 'completed' ? 'Completed' : `${formatSpeed(model.speed)} • ETA ${formatEta(model.etaMs)}`}</span>
+									<span>{model.status === 'completed' ? `Completed (${formatBytes(model.totalBytes)})` : `${formatSpeed(model.speed)} • ETA ${formatEta(model.etaMs)}`}</span>
 									{#if model.status !== 'completed'}
 										<span>{model.files.length} file{model.files.length === 1 ? '' : 's'}</span>
 									{/if}

@@ -51,6 +51,59 @@ const sidebarVisible = $derived(chatSidebarVisible());
 	let selectedSharding = $state<'Pipeline' | 'Tensor'>('Pipeline');
 	type InstanceMeta = 'MlxRing' | 'MlxIbv' | 'MlxJaccl';
 	
+	// Launch defaults persistence
+	const LAUNCH_DEFAULTS_KEY = 'exo-launch-defaults';
+	interface LaunchDefaults {
+		modelId: string | null;
+		sharding: 'Pipeline' | 'Tensor';
+		instanceType: InstanceMeta;
+		minNodes: number;
+	}
+	
+	function saveLaunchDefaults(): void {
+		const defaults: LaunchDefaults = {
+			modelId: selectedPreviewModelId(),
+			sharding: selectedSharding,
+			instanceType: selectedInstanceType,
+			minNodes: selectedMinNodes,
+		};
+		try {
+			localStorage.setItem(LAUNCH_DEFAULTS_KEY, JSON.stringify(defaults));
+		} catch (e) {
+			console.warn('Failed to save launch defaults:', e);
+		}
+	}
+	
+	function loadLaunchDefaults(): LaunchDefaults | null {
+		try {
+			const stored = localStorage.getItem(LAUNCH_DEFAULTS_KEY);
+			if (!stored) return null;
+			return JSON.parse(stored) as LaunchDefaults;
+		} catch (e) {
+			console.warn('Failed to load launch defaults:', e);
+			return null;
+		}
+	}
+	
+	function applyLaunchDefaults(availableModels: Array<{id: string}>, maxNodes: number): void {
+		const defaults = loadLaunchDefaults();
+		if (!defaults) return;
+		
+		// Apply sharding and instance type unconditionally
+		selectedSharding = defaults.sharding;
+		selectedInstanceType = defaults.instanceType;
+		
+		// Apply minNodes if valid (between 1 and maxNodes)
+		if (defaults.minNodes && defaults.minNodes >= 1 && defaults.minNodes <= maxNodes) {
+			selectedMinNodes = defaults.minNodes;
+		}
+		
+		// Only apply model if it exists in the available models
+		if (defaults.modelId && availableModels.some(m => m.id === defaults.modelId)) {
+			selectPreviewModel(defaults.modelId);
+		}
+	}
+	
 	let selectedInstanceType = $state<InstanceMeta>('MlxRing');
 	let selectedMinNodes = $state<number>(1);
 	let minNodesInitialized = $state(false);
@@ -298,6 +351,9 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 				const data = await response.json();
 				// API returns { data: [{ id, name }] } format
 				models = data.data || [];
+				// Restore last launch defaults if available
+				const currentNodeCount = topologyData() ? Object.keys(topologyData()!.nodes).length : 1;
+				applyLaunchDefaults(models, currentNodeCount);
 			}
 		} catch (error) {
 			console.error('Failed to fetch models:', error);
@@ -344,10 +400,8 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 				const errorText = await response.text();
 				console.error('Failed to launch instance:', errorText);
 			} else {
-				// Auto-select the launched model only if no model is currently selected
-				if (!selectedChatModel()) {
-					setSelectedChatModel(modelId);
-				}
+				// Always auto-select the newly launched model so the user chats to what they just launched
+				setSelectedChatModel(modelId);
 				
 				// Scroll to the bottom of instances container to show the new instance
 				// Use multiple attempts to ensure DOM has updated with the new instance
@@ -380,8 +434,8 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 		const shardData = shardObj[shardKeys[0]] as Record<string, unknown>;
 		if (!shardData) return null;
 		
-		// Model meta is nested: shard.model_meta.model_id
-		const modelMeta = shardData.model_meta ?? shardData.modelMeta;
+		// Model meta is nested: shard.model_card.model_id
+		const modelMeta = shardData.model_card ?? shardData.modelCard;
 		if (!modelMeta || typeof modelMeta !== 'object') return null;
 		
 		const meta = modelMeta as Record<string, unknown>;
@@ -537,7 +591,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 		// Unwrap the instance
 		const [instanceTag, instance] = getTagged(instanceWrapped);
 		if (!instance || typeof instance !== 'object') {
-			return { isDownloading: false, progress: null, statusText: 'UNKNOWN', perNode: [] };
+			return { isDownloading: false, progress: null, statusText: 'PREPARING', perNode: [] };
 		}
 
 		const inst = instance as { shardAssignments?: { nodeToRunner?: Record<string, string>; runnerToShard?: Record<string, unknown>; modelId?: string } };
@@ -650,7 +704,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 	function deriveInstanceStatus(instanceWrapped: unknown): { statusText: string; statusClass: string } {
 		const [, instance] = getTagged(instanceWrapped);
 		if (!instance || typeof instance !== 'object') {
-			return { statusText: 'UNKNOWN', statusClass: 'inactive' };
+			return { statusText: 'PREPARING', statusClass: 'inactive' };
 		}
 		
 		const inst = instance as { shardAssignments?: { runnerToShard?: Record<string, unknown> } };
@@ -679,7 +733,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 
 		const has = (s: string) => statuses.includes(s);
 
-		if (statuses.length === 0) return { statusText: 'UNKNOWN', statusClass: 'inactive' };
+		if (statuses.length === 0) return { statusText: 'PREPARING', statusClass: 'inactive' };
 		if (has('Failed')) return { statusText: 'FAILED', statusClass: 'failed' };
 		if (has('Shutdown')) return { statusText: 'SHUTDOWN', statusClass: 'inactive' };
 		if (has('Loading')) return { statusText: 'LOADING', statusClass: 'starting' };
@@ -707,6 +761,10 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 	async function deleteInstance(instanceId: string) {
 		if (!confirm(`Delete instance ${instanceId.slice(0, 8)}...?`)) return;
 		
+		// Get the model ID of the instance being deleted before we delete it
+		const deletedInstanceModelId = getInstanceModelId(instanceData[instanceId]);
+		const wasSelected = selectedChatModel() === deletedInstanceModelId;
+		
 		try {
 			const response = await fetch(`/instance/${instanceId}`, {
 				method: 'DELETE',
@@ -715,6 +773,24 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 			
 			if (!response.ok) {
 				console.error('Failed to delete instance:', response.status);
+			} else if (wasSelected) {
+				// If we deleted the currently selected model, switch to another available model
+				// Find another instance that isn't the one we just deleted
+				const remainingInstances = Object.entries(instanceData).filter(([id]) => id !== instanceId);
+				if (remainingInstances.length > 0) {
+					// Select the last instance (most recently added, since objects preserve insertion order)
+					const [, lastInstance] = remainingInstances[remainingInstances.length - 1];
+					const newModelId = getInstanceModelId(lastInstance);
+					if (newModelId && newModelId !== 'Unknown' && newModelId !== 'Unknown Model') {
+						setSelectedChatModel(newModelId);
+					} else {
+						// Clear selection if no valid model found
+						setSelectedChatModel('');
+					}
+				} else {
+					// No more instances, clear the selection
+					setSelectedChatModel('');
+				}
 			}
 		} catch (error) {
 			console.error('Error deleting instance:', error);
@@ -839,7 +915,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 		const runnerEntries = Object.entries(runnerToShard).map(([runnerId, shardWrapped]) => {
 			const [tag, shard] = getTagged(shardWrapped);
 			const meta = (shard as { modelMeta?: { worldSize?: number; nLayers?: number; deviceRank?: number } } | undefined);
-			const deviceRank = (meta?.deviceRank as number | undefined) ?? 0;
+			const deviceRank = meta?.modelMeta?.deviceRank ?? 0;
 			return { runnerId, tag, deviceRank };
 		});
 
@@ -988,6 +1064,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 
 	function handleSliderMouseUp() {
 		isDraggingSlider = false;
+		saveLaunchDefaults();
 	}
 
 	// Handle touch events for mobile
@@ -1007,6 +1084,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 
 	function handleSliderTouchEnd() {
 		isDraggingSlider = false;
+		saveLaunchDefaults();
 	}
 
 	const nodeCount = $derived(data ? Object.keys(data.nodes).length : 0);
@@ -1214,9 +1292,9 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 							<div class="flex-1 h-px bg-gradient-to-r from-exo-yellow/30 to-transparent"></div>
 						</div>
 						
-						<div 
+						<div
 							bind:this={instancesContainerRef}
-							class="max-h-72 space-y-3 overflow-y-auto"
+							class="max-h-72 xl:max-h-96 space-y-3 overflow-y-auto overflow-x-hidden py-px"
 						>
 								{#each Object.entries(instanceData) as [id, instance]}
 									{@const downloadInfo = getInstanceDownloadStatus(id, instance)}
@@ -1469,6 +1547,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 												onclick={() => {
 													if (modelCanFit) {
 														selectPreviewModel(model.id);
+														saveLaunchDefaults();
 														isModelDropdownOpen = false;
 														modelDropdownSearch = '';
 													}
@@ -1502,7 +1581,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 								<div class="text-xs text-white/70 font-mono mb-2">Sharding:</div>
 								<div class="flex gap-2">
 									<button 
-										onclick={() => selectedSharding = 'Pipeline'}
+										onclick={() => { selectedSharding = 'Pipeline'; saveLaunchDefaults(); }}
 										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding === 'Pipeline' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
 									>
 										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedSharding === 'Pipeline' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
@@ -1513,7 +1592,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 										Pipeline
 									</button>
 									<button 
-										onclick={() => selectedSharding = 'Tensor'}
+										onclick={() => { selectedSharding = 'Tensor'; saveLaunchDefaults(); }}
 										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding === 'Tensor' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
 									>
 										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedSharding === 'Tensor' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
@@ -1531,7 +1610,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 								<div class="text-xs text-white/70 font-mono mb-2">Instance Type:</div>
 								<div class="flex gap-2">
 									<button 
-										onclick={() => selectedInstanceType = 'MlxRing'}
+										onclick={() => { selectedInstanceType = 'MlxRing'; saveLaunchDefaults(); }}
 										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType === 'MlxRing' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
 									>
 										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedInstanceType === 'MlxRing' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
@@ -1542,7 +1621,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 										MLX Ring
 									</button>
 									<button 
-										onclick={() => selectedInstanceType = 'MlxIbv'}
+										onclick={() => { selectedInstanceType = 'MlxIbv'; saveLaunchDefaults(); }}
 										class="flex items-center gap-2 py-2 px-4 text-sm font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType === 'MlxIbv' ? 'bg-transparent text-exo-yellow border-exo-yellow' : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
 									>
 										<span class="w-4 h-4 rounded-full border-2 flex items-center justify-center {selectedInstanceType === 'MlxIbv' ? 'border-exo-yellow' : 'border-exo-medium-gray'}">
@@ -1719,7 +1798,7 @@ function toggleInstanceDownloadDetails(nodeId: string): void {
 								<h3 class="text-xs text-exo-yellow font-mono tracking-[0.2em] uppercase">Instances</h3>
 								<div class="flex-1 h-px bg-gradient-to-r from-exo-yellow/30 to-transparent"></div>
 							</div>
-								<div class="space-y-3 max-h-72 overflow-y-auto pr-1">
+								<div class="space-y-3 max-h-72 xl:max-h-96 overflow-y-auto overflow-x-hidden py-px pr-1">
 									{#each Object.entries(instanceData) as [id, instance]}
 										{@const downloadInfo = getInstanceDownloadStatus(id, instance)}
 										{@const statusText = downloadInfo.statusText}
