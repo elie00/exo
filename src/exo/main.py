@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import multiprocessing as mp
 import os
 import resource
@@ -199,10 +200,8 @@ def main():
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 65535), hard))
 
-    try:
+    with contextlib.suppress(RuntimeError):
         mp.set_start_method("spawn")
-    except RuntimeError:
-        pass  # Already set, which is fine
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
     logger.info("Starting EXO")

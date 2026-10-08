@@ -11,16 +11,13 @@ from exo.worker.tests.unittests.test_mlx.conftest import (
     run_gpt_oss_pipeline_device,
     run_gpt_oss_tensor_parallel_device,
 )
+from exo.worker.tests.unittests.test_mlx.model_requirements import missing_gpt_oss_files
 
-
-def _check_model_exists() -> bool:
-    return DEFAULT_GPT_OSS_CONFIG.model_path.exists()
-
-
+_missing_files = missing_gpt_oss_files(DEFAULT_GPT_OSS_CONFIG.model_path)
 pytestmark = [
     pytest.mark.skipif(
-        not _check_model_exists(),
-        reason=f"GPT-OSS model not found at {DEFAULT_GPT_OSS_CONFIG.model_path}",
+        bool(_missing_files),
+        reason=f"Incomplete GPT-OSS model at {DEFAULT_GPT_OSS_CONFIG.model_path}: missing {', '.join(_missing_files)}",
     ),
 ]
 

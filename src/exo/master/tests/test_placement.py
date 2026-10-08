@@ -270,14 +270,17 @@ def test_get_transition_events_delete_instance(instance: Instance):
     assert events[0].instance_id == instance_id
 
 
+@pytest.mark.parametrize("required_bytes", [1000, 1500])
 def test_placement_selects_leaf_nodes(
     model_card: ModelCard,
+    required_bytes: int,
 ):
     # arrange
     topology = Topology()
 
-    # Model requires more than any single node but fits within a 3-node cycle
-    model_card.storage_size.in_bytes = 1500
+    # A chain has only one- and two-node cycles. 1000 bytes fits the leaf
+    # pairs; 1500 bytes fits no cycle, even though the whole chain has 2200.
+    model_card.storage_size.in_bytes = required_bytes
     model_card.n_layers = 12
 
     node_id_a = NodeId()
@@ -326,6 +329,10 @@ def test_placement_selects_leaf_nodes(
     cic = place_instance_command(model_card=model_card)
 
     # act
+    if required_bytes == 1500:
+        with pytest.raises(ValueError, match="No cycles found with sufficient memory"):
+            place_instance(cic, topology, {}, node_memory, node_network)
+        return
     placements = place_instance(cic, topology, {}, node_memory, node_network)
 
     # assert

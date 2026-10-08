@@ -8,6 +8,7 @@ from loguru import logger
 from exo.master.placement_utils import (
     Cycle,
     filter_cycles_by_memory,
+    get_cycle_effective_memory,
     get_mlx_jaccl_coordinators,
     get_mlx_jaccl_devices_matrix,
     get_mlx_ring_hosts_by_node,
@@ -23,7 +24,6 @@ from exo.shared.types.commands import (
 )
 from exo.shared.types.common import NodeId
 from exo.shared.types.events import Event, InstanceCreated, InstanceDeleted
-from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
 from exo.shared.types.worker.instances import (
     Instance,
@@ -57,10 +57,18 @@ def place_instance(
     node_memory: Mapping[NodeId, MemoryUsage],
     node_network: Mapping[NodeId, NodeNetworkInfo],
 ) -> dict[InstanceId, Instance]:
+    if command.instance_meta == InstanceMeta.GGUFPipeline:
+        raise ValueError(
+            "GGUF pipeline placement requires an explicit model path and node ports; "
+            "use the GGUF launcher until the master placement API supports them"
+        )
     cycles = topology.get_cycles()
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
     cycles_with_sufficient_memory = filter_cycles_by_memory(
-        candidate_cycles, node_memory, command.model_card.storage_size
+        candidate_cycles,
+        node_memory,
+        command.model_card.storage_size,
+        prefer_gpu=command.prefer_gpu,
     )
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")
@@ -104,14 +112,19 @@ def place_instance(
 
     selected_cycle = max(
         cycles_with_leaf_nodes if cycles_with_leaf_nodes != [] else smallest_cycles,
-        key=lambda cycle: sum(
-            (node_memory[node_id].ram_available for node_id in cycle),
-            start=Memory(),
+        key=lambda cycle: get_cycle_effective_memory(
+            cycle,
+            node_memory,
+            prefer_gpu=command.prefer_gpu,
         ),
     )
 
     shard_assignments = get_shard_assignments(
-        command.model_card, selected_cycle, command.sharding, node_memory
+        command.model_card,
+        selected_cycle,
+        command.sharding,
+        node_memory,
+        prefer_gpu=command.prefer_gpu,
     )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)

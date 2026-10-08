@@ -37,10 +37,11 @@ class MlxJacclInstance(BaseInstance):
 
 class GGUFPipelineInstance(BaseInstance):
     """Instance for distributed GGUF/Ollama model inference.
-    
+
     Uses pipeline parallelism where each node handles a subset of layers
     and activations are passed between nodes via TCP.
     """
+
     gguf_model_path: str  # Path to GGUF file (on each node)
     pipeline_ports: dict[NodeId, int]  # Port each node listens on for activations
     node_order: list[NodeId]  # Order of nodes in the pipeline

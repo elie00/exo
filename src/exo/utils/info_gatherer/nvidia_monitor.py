@@ -1,208 +1,184 @@
-"""
-NVIDIA GPU monitoring module for Linux systems with NVIDIA GPUs.
+"""Optional NVML telemetry. Missing measurements are unknown, never idle GPUs."""
 
-This module provides GPU metrics collection similar to macmon.py but for NVIDIA GPUs
-using the pynvml library (NVIDIA Management Library Python bindings).
-"""
+# ruff: noqa: N802
+# Protocol method names must match NVIDIA's API.
 
+import asyncio
+import importlib
 import platform
-from typing import TYPE_CHECKING
+import threading
+from typing import Protocol, runtime_checkable
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict
-
-if TYPE_CHECKING:
-    import pynvml
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class NvidiaMonitorError(Exception):
-    """Exception raised for errors in the NVIDIA Monitor functions."""
+    """GPU discovery or required telemetry could not be collected."""
 
 
 class NvidiaGpuInfo(BaseModel):
-    """Information about a single NVIDIA GPU."""
-
     index: int
     name: str
     uuid: str
     memory_total_mb: int
     memory_used_mb: int
     memory_free_mb: int
-    gpu_utilization: float  # percentage 0-100
-    memory_utilization: float  # percentage 0-100
-    temperature: float  # Celsius
-    power_draw: float  # Watts
-    power_limit: float  # Watts
+    gpu_utilization: float | None
+    memory_utilization: float | None
+    temperature: float | None
+    power_draw: float | None
+    power_limit: float | None
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
 
 class NvidiaMetrics(BaseModel):
-    """Complete set of metrics for all NVIDIA GPUs in the system."""
-
+    # gpu_count and memory totals refer to readable devices only.
     gpu_count: int
     gpus: list[NvidiaGpuInfo]
-    # Aggregate metrics (from primary GPU or average)
-    gpu_usage: float  # percentage 0-100
-    gpu_temp: float  # Celsius
-    gpu_power: float  # Watts
+    gpu_usage: float | None
+    gpu_temp: float | None
+    gpu_power: float | None
     gpu_memory_total_mb: int
     gpu_memory_used_mb: int
     gpu_memory_free_mb: int
     driver_version: str
     cuda_version: str
+    detected_gpu_count: int | None = None
+    unavailable_gpu_indices: list[int] = Field(default_factory=list)
 
-    model_config = ConfigDict(extra="ignore")
-
-
-_nvml_initialized: bool = False
-_pynvml_module: "pynvml | None" = None
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
 
-def _get_pynvml() -> "pynvml":
-    """Lazily import and return the pynvml module."""
+class _MemoryInfo(Protocol):
+    total: int
+    used: int
+    free: int
+
+
+class _Utilization(Protocol):
+    gpu: int
+    memory: int
+
+
+@runtime_checkable
+class _Nvml(Protocol):
+    """The subset of NVIDIA's Python API used by this optional integration."""
+
+    NVMLError: type[Exception]
+    NVML_TEMPERATURE_GPU: int
+
+    def nvmlInit(self) -> None: ...
+    def nvmlShutdown(self) -> None: ...
+    def nvmlDeviceGetCount(self) -> int: ...
+    def nvmlDeviceGetHandleByIndex(self, index: int) -> object: ...
+    def nvmlDeviceGetName(self, handle: object) -> str | bytes: ...
+    def nvmlDeviceGetUUID(self, handle: object) -> str | bytes: ...
+    def nvmlDeviceGetMemoryInfo(self, handle: object) -> _MemoryInfo: ...
+    def nvmlDeviceGetUtilizationRates(self, handle: object) -> _Utilization: ...
+    def nvmlDeviceGetTemperature(self, handle: object, sensor: int) -> int: ...
+    def nvmlDeviceGetPowerUsage(self, handle: object) -> int: ...
+    def nvmlDeviceGetPowerManagementLimit(self, handle: object) -> int: ...
+    def nvmlSystemGetDriverVersion(self) -> str | bytes: ...
+    def nvmlSystemGetCudaDriverVersion_v2(self) -> int: ...
+
+
+_nvml_initialized = False
+_pynvml_module: _Nvml | None = None
+_nvml_lock = threading.RLock()
+
+
+def _get_pynvml() -> _Nvml:
     global _pynvml_module
     if _pynvml_module is None:
         try:
-            import pynvml as _pynvml
-
-            _pynvml_module = _pynvml
-        except ImportError as e:
+            module = importlib.import_module("pynvml")
+        except ImportError as exc:
             raise NvidiaMonitorError(
-                "pynvml is not installed. Install it with: pip install pynvml"
-            ) from e
+                "NVIDIA bindings are not installed. Install the optional nvidia-ml-py package."
+            ) from exc
+        if not isinstance(module, _Nvml):
+            raise NvidiaMonitorError(
+                "Installed NVIDIA bindings do not expose the required NVML API"
+            )
+        _pynvml_module = module
     return _pynvml_module
 
 
 def _ensure_nvml_initialized() -> None:
-    """Initialize NVML if not already initialized."""
     global _nvml_initialized
-    if not _nvml_initialized:
-        pynvml = _get_pynvml()
-        try:
-            pynvml.nvmlInit()
+    with _nvml_lock:
+        if not _nvml_initialized:
+            nvml = _get_pynvml()
+            try:
+                nvml.nvmlInit()
+            except nvml.NVMLError as exc:
+                raise NvidiaMonitorError(f"Failed to initialize NVML: {exc}") from exc
             _nvml_initialized = True
-
-            # Log GPU discovery info
-            device_count = pynvml.nvmlDeviceGetCount()
-            driver_version = pynvml.nvmlSystemGetDriverVersion()
-            if isinstance(driver_version, bytes):
-                driver_version = driver_version.decode("utf-8")
-
-            logger.info(
-                f"NVIDIA NVML initialized: {device_count} GPU(s) detected, driver {driver_version}"
-            )
-
-            # Log individual GPU info
-            for i in range(device_count):
-                try:
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                    name = pynvml.nvmlDeviceGetName(handle)
-                    if isinstance(name, bytes):
-                        name = name.decode("utf-8")
-                    memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    memory_gb = memory_info.total / (1024**3)
-                    logger.info(f"  GPU {i}: {name} ({memory_gb:.1f} GB VRAM)")
-                except pynvml.NVMLError as e:
-                    logger.warning(f"  GPU {i}: Could not query info: {e}")
-
-        except pynvml.NVMLError as e:
-            raise NvidiaMonitorError(f"Failed to initialize NVML: {e}") from e
 
 
 def is_nvidia_available() -> bool:
-    """Check if NVIDIA GPU monitoring is available on this system."""
-    # Only support Linux for now (could extend to Windows)
-    system = platform.system().lower()
-    if system not in ("linux", "windows"):
-        logger.debug(
-            f"NVIDIA monitoring not available on {system} (only Linux/Windows supported)"
-        )
+    if platform.system().lower() not in {"linux", "windows"}:
         return False
-
     try:
-        _ensure_nvml_initialized()
-        pynvml = _get_pynvml()
-        device_count = pynvml.nvmlDeviceGetCount()
-        if device_count > 0:
-            logger.debug(f"NVIDIA monitoring available: {device_count} GPU(s)")
-            return True
-        else:
-            logger.debug("NVIDIA driver loaded but no GPUs found")
-            return False
-    except NvidiaMonitorError as e:
-        logger.debug(f"NVIDIA monitoring not available: {e}")
-        return False
-    except Exception as e:
-        logger.debug(f"NVIDIA monitoring check failed: {e}")
+        return get_gpu_count() > 0
+    except NvidiaMonitorError:
         return False
 
 
 def get_gpu_count() -> int:
-    """Get the number of NVIDIA GPUs in the system."""
-    _ensure_nvml_initialized()
-    pynvml = _get_pynvml()
-    return pynvml.nvmlDeviceGetCount()
+    with _nvml_lock:
+        _ensure_nvml_initialized()
+        nvml = _get_pynvml()
+        try:
+            return nvml.nvmlDeviceGetCount()
+        except nvml.NVMLError as exc:
+            raise NvidiaMonitorError(f"Could not count NVIDIA GPUs: {exc}") from exc
+
+
+def _text(value: str | bytes) -> str:
+    return (
+        value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    )
 
 
 def _get_gpu_info(index: int) -> NvidiaGpuInfo:
-    """Get detailed information about a specific GPU."""
     _ensure_nvml_initialized()
-    pynvml = _get_pynvml()
-
-    handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-
-    # Basic info
-    name = pynvml.nvmlDeviceGetName(handle)
-    if isinstance(name, bytes):
-        name = name.decode("utf-8")
-    uuid = pynvml.nvmlDeviceGetUUID(handle)
-    if isinstance(uuid, bytes):
-        uuid = uuid.decode("utf-8")
-
-    # Memory info
-    memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    memory_total_mb = memory_info.total // (1024 * 1024)
-    memory_used_mb = memory_info.used // (1024 * 1024)
-    memory_free_mb = memory_info.free // (1024 * 1024)
-
-    # Utilization
+    nvml = _get_pynvml()
+    handle = nvml.nvmlDeviceGetHandleByIndex(index)
+    name = _text(nvml.nvmlDeviceGetName(handle))
+    uuid = _text(nvml.nvmlDeviceGetUUID(handle))
+    memory = nvml.nvmlDeviceGetMemoryInfo(handle)
     try:
-        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        gpu_utilization = float(utilization.gpu)
-        memory_utilization = float(utilization.memory)
-    except pynvml.NVMLError:
-        gpu_utilization = 0.0
-        memory_utilization = 0.0
-
-    # Temperature
+        utilization = nvml.nvmlDeviceGetUtilizationRates(handle)
+        gpu_utilization, memory_utilization = (
+            float(utilization.gpu),
+            float(utilization.memory),
+        )
+    except nvml.NVMLError:
+        gpu_utilization, memory_utilization = None, None
     try:
         temperature = float(
-            pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+            nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
         )
-    except pynvml.NVMLError:
-        temperature = 0.0
-
-    # Power
+    except nvml.NVMLError:
+        temperature = None
     try:
-        power_draw = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW to W
-    except pynvml.NVMLError:
-        power_draw = 0.0
-
+        power_draw = nvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+    except nvml.NVMLError:
+        power_draw = None
     try:
-        power_limit = (
-            pynvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0
-        )  # mW to W
-    except pynvml.NVMLError:
-        power_limit = 0.0
-
+        power_limit = nvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0
+    except nvml.NVMLError:
+        power_limit = None
     return NvidiaGpuInfo(
         index=index,
         name=name,
         uuid=uuid,
-        memory_total_mb=memory_total_mb,
-        memory_used_mb=memory_used_mb,
-        memory_free_mb=memory_free_mb,
+        memory_total_mb=memory.total // (1024 * 1024),
+        memory_used_mb=memory.used // (1024 * 1024),
+        memory_free_mb=memory.free // (1024 * 1024),
         gpu_utilization=gpu_utilization,
         memory_utilization=memory_utilization,
         temperature=temperature,
@@ -211,102 +187,83 @@ def _get_gpu_info(index: int) -> NvidiaGpuInfo:
     )
 
 
+def _complete_sum(values: list[float | None]) -> float | None:
+    if any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
+
+
 def get_metrics() -> NvidiaMetrics:
-    """
-    Get comprehensive metrics for all NVIDIA GPUs in the system.
+    """Collect one serialized snapshot; shutdown cannot interrupt NVML calls."""
+    with _nvml_lock:
+        return _collect_metrics()
 
-    Returns:
-        NvidiaMetrics: Complete metrics including per-GPU details and aggregates.
 
-    Raises:
-        NvidiaMonitorError: If there's an error accessing GPU metrics.
-    """
+def _collect_metrics() -> NvidiaMetrics:
     _ensure_nvml_initialized()
-    pynvml = _get_pynvml()
-
+    nvml = _get_pynvml()
     try:
-        gpu_count = pynvml.nvmlDeviceGetCount()
-
-        if gpu_count == 0:
+        count = nvml.nvmlDeviceGetCount()
+        if count == 0:
             raise NvidiaMonitorError("No NVIDIA GPUs found")
-
-        # Get driver and CUDA versions
         try:
-            driver_version = pynvml.nvmlSystemGetDriverVersion()
-            if isinstance(driver_version, bytes):
-                driver_version = driver_version.decode("utf-8")
-        except pynvml.NVMLError:
-            driver_version = "Unknown"
-
+            driver = _text(nvml.nvmlSystemGetDriverVersion())
+        except nvml.NVMLError:
+            driver = "Unknown"
         try:
-            cuda_version = pynvml.nvmlSystemGetCudaDriverVersion_v2()
-            cuda_major = cuda_version // 1000
-            cuda_minor = (cuda_version % 1000) // 10
-            cuda_version_str = f"{cuda_major}.{cuda_minor}"
-        except pynvml.NVMLError:
-            cuda_version_str = "Unknown"
-
-        # Collect info for all GPUs
+            version = nvml.nvmlSystemGetCudaDriverVersion_v2()
+            cuda = f"{version // 1000}.{(version % 1000) // 10}"
+        except nvml.NVMLError:
+            cuda = "Unknown"
         gpus: list[NvidiaGpuInfo] = []
-        for i in range(gpu_count):
+        unavailable: list[int] = []
+        for index in range(count):
             try:
-                gpu_info = _get_gpu_info(i)
-                gpus.append(gpu_info)
-            except pynvml.NVMLError as e:
-                # Skip GPUs that can't be queried
-                continue
-
+                gpus.append(_get_gpu_info(index))
+            except nvml.NVMLError:
+                unavailable.append(index)
         if not gpus:
             raise NvidiaMonitorError("Could not query any NVIDIA GPUs")
-
-        # Calculate aggregates from primary GPU (index 0)
-        primary_gpu = gpus[0]
-
-        # Calculate totals for memory
-        total_memory = sum(g.memory_total_mb for g in gpus)
-        used_memory = sum(g.memory_used_mb for g in gpus)
-        free_memory = sum(g.memory_free_mb for g in gpus)
-
-        # Average utilization and temperature across all GPUs
-        avg_utilization = sum(g.gpu_utilization for g in gpus) / len(gpus)
-        avg_temp = sum(g.temperature for g in gpus) / len(gpus)
-        total_power = sum(g.power_draw for g in gpus)
-
+        utilization = _complete_sum([gpu.gpu_utilization for gpu in gpus])
+        temperature = _complete_sum([gpu.temperature for gpu in gpus])
+        power = _complete_sum([gpu.power_draw for gpu in gpus])
         return NvidiaMetrics(
             gpu_count=len(gpus),
+            detected_gpu_count=count,
+            unavailable_gpu_indices=unavailable,
             gpus=gpus,
-            gpu_usage=avg_utilization,
-            gpu_temp=avg_temp,
-            gpu_power=total_power,
-            gpu_memory_total_mb=total_memory,
-            gpu_memory_used_mb=used_memory,
-            gpu_memory_free_mb=free_memory,
-            driver_version=driver_version,
-            cuda_version=cuda_version_str,
+            gpu_usage=utilization / len(gpus)
+            if utilization is not None and not unavailable
+            else None,
+            gpu_temp=temperature / len(gpus)
+            if temperature is not None and not unavailable
+            else None,
+            gpu_power=power if not unavailable else None,
+            gpu_memory_total_mb=sum(gpu.memory_total_mb for gpu in gpus),
+            gpu_memory_used_mb=sum(gpu.memory_used_mb for gpu in gpus),
+            gpu_memory_free_mb=sum(gpu.memory_free_mb for gpu in gpus),
+            driver_version=driver,
+            cuda_version=cuda,
         )
-
-    except pynvml.NVMLError as e:
-        raise NvidiaMonitorError(f"Error getting NVIDIA metrics: {e}") from e
+    except nvml.NVMLError as exc:
+        raise NvidiaMonitorError(f"Error getting NVIDIA metrics: {exc}") from exc
 
 
 async def get_metrics_async() -> NvidiaMetrics:
-    """
-    Asynchronously get NVIDIA GPU metrics.
-
-    This is a wrapper around get_metrics() for consistency with macmon API.
-    NVML calls are generally fast enough to not require true async execution,
-    but we could move this to a thread pool if needed.
-    """
-    return get_metrics()
+    """Keep blocking driver calls off the event loop."""
+    return await asyncio.to_thread(get_metrics)
 
 
 def shutdown() -> None:
-    """Shutdown NVML. Should be called when the application exits."""
     global _nvml_initialized
-    if _nvml_initialized:
-        try:
-            pynvml = _get_pynvml()
-            pynvml.nvmlShutdown()
-            _nvml_initialized = False
-        except Exception:
-            pass
+    with _nvml_lock:
+        if _nvml_initialized:
+            nvml = _get_pynvml()
+            try:
+                nvml.nvmlShutdown()
+            except nvml.NVMLError:
+                logger.warning(
+                    "NVML shutdown failed; clearing local initialization state"
+                )
+            finally:
+                _nvml_initialized = False

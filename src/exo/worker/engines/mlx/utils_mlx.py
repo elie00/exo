@@ -46,6 +46,7 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import ChatCompletionTaskParams
 from exo.shared.types.worker.instances import (
     BoundInstance,
+    GGUFPipelineInstance,
     MlxJacclInstance,
     MlxRingInstance,
 )
@@ -131,6 +132,10 @@ def mlx_distributed_init(
     try:
         # TODO: singleton instances
         match bound_instance.instance:
+            case GGUFPipelineInstance():
+                raise ValueError(
+                    "GGUF instances cannot initialize an MLX process group"
+                )
             case MlxRingInstance(hosts_by_node=hosts_by_node, ephemeral_port=_):
                 coordination_file = (
                     f"./hosts_{bound_instance.instance.instance_id}_{rank}.json"
