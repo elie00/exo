@@ -2,7 +2,8 @@
 """Distributed GGUF inference launcher.
 
 This script coordinates distributed inference across multiple nodes,
-enabling true weight sharding for Ollama/GGUF models.
+using the experimental token relay for Ollama/GGUF models.
+It does not distribute transformer-layer computation.
 
 Usage:
     # On each node, run with appropriate configuration:
@@ -29,20 +30,28 @@ from pathlib import Path
 from typing import Optional
 
 from loguru import logger
+from pydantic import BaseModel, Field, ValidationError
 
-from exo.worker.engines.gguf.ollama_discovery import discover_ollama_models
+from exo.worker.engines.gguf.distributed_pipeline import (
+    DistributedGGUFPipeline,
+    PipelineNodeConfig,
+)
 from exo.worker.engines.gguf.gguf_loader import load_gguf_metadata
 from exo.worker.engines.gguf.gguf_sharding import calculate_shard_assignments
-from exo.worker.engines.gguf.distributed_pipeline import (
-    PipelineNodeConfig,
-    DistributedGGUFPipeline,
-    NodeRole,
+from exo.worker.engines.gguf.ollama_discovery import (
+    OllamaManifest,
+    discover_ollama_models,
 )
+
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_tokens: int = Field(default=256, gt=0, le=32768)
 
 
 def parse_node_addresses(nodes_str: str) -> list[tuple[str, int]]:
     """Parse node addresses from comma-separated string."""
-    addresses = []
+    addresses: list[tuple[str, int]] = []
     for node in nodes_str.split(","):
         parts = node.strip().split(":")
         if len(parts) != 2:
@@ -55,11 +64,11 @@ def parse_node_addresses(nodes_str: str) -> list[tuple[str, int]]:
 
 def get_model_path(model_name: str) -> Optional[Path]:
     """Get path to Ollama model by name or direct path.
-    
+
     Args:
         model_name: Either an Ollama model name (e.g., 'qwen3-coder:30b')
                    or a direct path to a GGUF file
-    
+
     Returns:
         Path to the GGUF file, or None if not found
     """
@@ -68,44 +77,51 @@ def get_model_path(model_name: str) -> Optional[Path]:
     if direct_path.exists() and direct_path.is_file():
         logger.info(f"Using direct GGUF path: {direct_path}")
         return direct_path
-    
+
     # Try Ollama model discovery
     if ":" in model_name:
         name, tag = model_name.split(":", 1)
     else:
         name, tag = model_name, "latest"
-    
+
     models = discover_ollama_models()
     for model in models:
         if model.name == name and model.tag == tag:
             return model.model_path
-    
+
     # If we still haven't found it, try some common direct paths
     # This helps when running on systems with non-standard Ollama installations
     fallback_paths = [
-        Path(f"/usr/share/ollama/.ollama/models/blobs"),
+        Path("/usr/share/ollama/.ollama/models/blobs"),
         Path.home() / ".ollama" / "models" / "blobs",
     ]
-    
+
     for blobs_dir in fallback_paths:
         if blobs_dir.exists():
             # Look for the model by scanning manifest files
-            manifests_base = blobs_dir.parent / "manifests" / "registry.ollama.ai" / "library" / name / tag
+            manifests_base = (
+                blobs_dir.parent
+                / "manifests"
+                / "registry.ollama.ai"
+                / "library"
+                / name
+                / tag
+            )
             if manifests_base.exists():
                 try:
-                    import json
-                    with open(manifests_base) as f:
-                        manifest = json.load(f)
-                    for layer in manifest.get("layers", []):
-                        if "model" in layer.get("mediaType", ""):
-                            digest = layer.get("digest", "").replace(":", "-")
+                    manifest = OllamaManifest.model_validate_json(
+                        manifests_base.read_bytes()
+                    )
+                    for layer in manifest.layers:
+                        if "model" in layer.media_type:
+                            digest = layer.digest.replace(":", "-")
                             blob_path = blobs_dir / digest
                             if blob_path.exists():
                                 logger.info(f"Found model via fallback: {blob_path}")
                                 return blob_path
                 except Exception as e:
                     logger.debug(f"Fallback search failed: {e}")
-    
+
     return None
 
 
@@ -119,23 +135,23 @@ async def run_distributed_node(
     interactive: bool = False,
 ) -> None:
     """Run a distributed inference node."""
-    
+
     # Get sharding plan
     info = load_gguf_metadata(model_path, load_tensors=False)
     plan = calculate_shard_assignments(model_path, world_size, info)
     assignment = plan.get_assignment_for_rank(rank)
-    
+
     # Build config
     this_host, this_port = node_addresses[rank]
-    
+
     prev_host, prev_port = None, None
     if rank > 0:
         prev_host, prev_port = node_addresses[rank - 1]
-    
+
     next_host, next_port = None, None
     if rank < world_size - 1:
         next_host, next_port = node_addresses[rank + 1]
-    
+
     config = PipelineNodeConfig(
         node_id=f"node-{rank}",
         rank=rank,
@@ -151,11 +167,11 @@ async def run_distributed_node(
         next_node_host=next_host,
         next_node_port=next_port,
     )
-    
+
     # Print configuration
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"🚀 Distributed GGUF Node {rank}/{world_size}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Role: {config.role.value.upper()}")
     print(f"Layers: {config.start_layer} - {config.end_layer - 1}")
     print(f"Listening on: {this_host}:{this_port}")
@@ -163,23 +179,23 @@ async def run_distributed_node(
         print(f"Previous node: {prev_host}:{prev_port}")
     if next_host:
         print(f"Next node: {next_host}:{next_port}")
-    print(f"{'='*60}\n")
-    
+    print(f"{'=' * 60}\n")
+
     # Create pipeline
     pipeline = DistributedGGUFPipeline(config)
-    
+
     # Set up token callback for tail node
     async def on_token(token: str):
         print(token, end="", flush=True)
-    
+
     if config.is_tail:
         pipeline.set_generation_callback(on_token)
-    
+
     # Initialize
     print("⏳ Initializing pipeline...")
     await pipeline.initialize()
     print("✅ Pipeline initialized\n")
-    
+
     try:
         if config.is_head:
             # Head node handles prompts
@@ -197,10 +213,10 @@ async def run_distributed_node(
             # Worker nodes wait for activations
             print("⏳ Waiting for activations from previous node...")
             await pipeline.run_inference("", max_tokens)
-    
+
     except KeyboardInterrupt:
         print("\n\n🛑 Interrupted")
-    
+
     finally:
         await pipeline.shutdown()
         print("👋 Node shutdown complete")
@@ -209,19 +225,19 @@ async def run_distributed_node(
 async def run_interactive(pipeline: DistributedGGUFPipeline, max_tokens: int):
     """Run interactive chat mode."""
     print("🎯 Interactive mode - type 'quit' to exit\n")
-    
+
     while True:
         try:
             prompt = input("You: ").strip()
-            if prompt.lower() in ('quit', 'exit', 'q'):
+            if prompt.lower() in ("quit", "exit", "q"):
                 break
             if not prompt:
                 continue
-            
+
             print("Assistant: ", end="")
             await pipeline.run_inference(prompt, max_tokens)
             print("\n")
-            
+
         except EOFError:
             break
 
@@ -235,23 +251,23 @@ async def run_server_mode(
 ) -> None:
     """Run node in server mode with HTTP API."""
     from aiohttp import web
-    
+
     # Get sharding plan
     info = load_gguf_metadata(model_path, load_tensors=False)
     plan = calculate_shard_assignments(model_path, world_size, info)
     assignment = plan.get_assignment_for_rank(rank)
-    
+
     # Build config
-    this_host, this_port = node_addresses[rank]
-    
+    _, this_port = node_addresses[rank]
+
     prev_host, prev_port = None, None
     if rank > 0:
         prev_host, prev_port = node_addresses[rank - 1]
-    
+
     next_host, next_port = None, None
     if rank < world_size - 1:
         next_host, next_port = node_addresses[rank + 1]
-    
+
     config = PipelineNodeConfig(
         node_id=f"node-{rank}",
         rank=rank,
@@ -267,70 +283,78 @@ async def run_server_mode(
         next_node_host=next_host,
         next_node_port=next_port,
     )
-    
+
     pipeline = DistributedGGUFPipeline(config)
-    
+
     # Token buffer for streaming
     token_buffer: list[str] = []
-    
+
     async def on_token(token: str):
         token_buffer.append(token)
-    
+
     if config.is_tail:
         pipeline.set_generation_callback(on_token)
-    
+
     await pipeline.initialize()
-    
+
     # HTTP handlers
     async def handle_generate(request: web.Request) -> web.Response:
         if not config.is_head:
             return web.json_response(
-                {"error": "Only head node accepts requests"},
-                status=400
+                {"error": "Only head node accepts requests"}, status=400
             )
-        
-        data = await request.json()
-        prompt = data.get("prompt", "")
-        max_tokens = data.get("max_tokens", 256)
-        
+
+        try:
+            data = GenerateRequest.model_validate_json(await request.text())
+        except ValidationError:
+            return web.json_response(
+                {"error": "Invalid generation request"}, status=400
+            )
+        prompt = data.prompt
+        max_tokens = data.max_tokens
+
         token_buffer.clear()
         await pipeline.run_inference(prompt, max_tokens)
-        
+
         response_text = "".join(token_buffer)
-        return web.json_response({
-            "response": response_text,
-            "tokens": len(token_buffer),
-        })
-    
+        return web.json_response(
+            {
+                "response": response_text,
+                "tokens": len(token_buffer),
+            }
+        )
+
     async def handle_health(request: web.Request) -> web.Response:
-        return web.json_response({
-            "status": "ok",
-            "rank": rank,
-            "role": config.role.value,
-            "layers": f"{config.start_layer}-{config.end_layer-1}",
-        })
-    
+        return web.json_response(
+            {
+                "status": "ok",
+                "rank": rank,
+                "role": config.role.value,
+                "layers": f"{config.start_layer}-{config.end_layer - 1}",
+            }
+        )
+
     # Set up routes
     app = web.Application()
     app.router.add_post("/v1/generate", handle_generate)
     app.router.add_get("/health", handle_health)
-    
+
     # Start worker task if not head
     worker_task = None
     if not config.is_head:
         worker_task = asyncio.create_task(pipeline.run_inference("", 0))
-    
+
     # Run server
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", api_port)
-    
+
     print(f"\n🌐 HTTP API running on http://0.0.0.0:{api_port}")
-    print(f"   POST /v1/generate - Generate text")
-    print(f"   GET  /health      - Health check\n")
-    
+    print("   POST /v1/generate - Generate text")
+    print("   GET  /health      - Health check\n")
+
     await site.start()
-    
+
     try:
         await asyncio.Event().wait()  # Run forever
     finally:
@@ -338,6 +362,18 @@ async def run_server_mode(
             worker_task.cancel()
         await runner.cleanup()
         await pipeline.shutdown()
+
+
+class LauncherArguments(argparse.Namespace):
+    rank: int
+    world_size: int
+    nodes: str
+    model: str
+    prompt: str | None
+    server: bool
+    api_port: int
+    max_tokens: int
+    interactive: bool
 
 
 def main():
@@ -360,76 +396,62 @@ Examples:
   # Server mode with HTTP API:
   %(prog)s --model qwen3-coder:30b --rank 0 --world-size 2 \\
            --nodes "localhost:50100,192.168.1.11:50100" --server
-        """
+        """,
     )
-    
+
     parser.add_argument(
-        "--model", "-m",
+        "--model", "-m", required=True, help="Ollama model name (e.g., qwen3-coder:30b)"
+    )
+    parser.add_argument(
+        "--rank", "-r", type=int, required=True, help="Rank of this node (0-indexed)"
+    )
+    parser.add_argument(
+        "--world-size", "-w", type=int, required=True, help="Total number of nodes"
+    )
+    parser.add_argument(
+        "--nodes",
+        "-n",
         required=True,
-        help="Ollama model name (e.g., qwen3-coder:30b)"
+        help="Comma-separated list of node addresses (host:port)",
+    )
+    parser.add_argument("--prompt", "-p", help="Prompt for generation (head node only)")
+    parser.add_argument(
+        "--max-tokens", "-t", type=int, default=256, help="Maximum tokens to generate"
     )
     parser.add_argument(
-        "--rank", "-r",
-        type=int,
-        required=True,
-        help="Rank of this node (0-indexed)"
-    )
-    parser.add_argument(
-        "--world-size", "-w",
-        type=int,
-        required=True,
-        help="Total number of nodes"
-    )
-    parser.add_argument(
-        "--nodes", "-n",
-        required=True,
-        help="Comma-separated list of node addresses (host:port)"
-    )
-    parser.add_argument(
-        "--prompt", "-p",
-        help="Prompt for generation (head node only)"
-    )
-    parser.add_argument(
-        "--max-tokens", "-t",
-        type=int,
-        default=256,
-        help="Maximum tokens to generate"
-    )
-    parser.add_argument(
-        "--interactive", "-i",
+        "--interactive",
+        "-i",
         action="store_true",
-        help="Interactive chat mode (head node only)"
+        help="Interactive chat mode (head node only)",
     )
     parser.add_argument(
-        "--server", "-s",
-        action="store_true",
-        help="Run in server mode with HTTP API"
+        "--server", "-s", action="store_true", help="Run in server mode with HTTP API"
     )
     parser.add_argument(
-        "--api-port",
-        type=int,
-        default=8000,
-        help="HTTP API port (server mode only)"
+        "--api-port", type=int, default=8000, help="HTTP API port (server mode only)"
     )
-    
-    args = parser.parse_args()
-    
+
+    args = LauncherArguments()
+    parser.parse_args(namespace=args)
+
     # Validate arguments
     if args.rank < 0 or args.rank >= args.world_size:
         print(f"Error: rank must be between 0 and {args.world_size - 1}")
         sys.exit(1)
-    
+
     # Parse node addresses
     try:
         node_addresses = parse_node_addresses(args.nodes)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
-    
+
     if len(node_addresses) != args.world_size:
-        print(f"Error: number of nodes ({len(node_addresses)}) must match world-size ({args.world_size})")
+        print(
+            f"Error: number of nodes ({len(node_addresses)}) must match world-size ({args.world_size})"
+        )
         sys.exit(1)
-    
+
     # Find model
     model_path = get_model_path(args.model)
     if model_path is None:
@@ -438,29 +460,33 @@ Examples:
         for model in discover_ollama_models():
             print(f"  - {model.full_name}")
         sys.exit(1)
-    
+
     print(f"📦 Model: {args.model}")
     print(f"📂 Path: {model_path}")
-    
+
     # Run
     if args.server:
-        asyncio.run(run_server_mode(
-            model_path=model_path,
-            rank=args.rank,
-            world_size=args.world_size,
-            node_addresses=node_addresses,
-            api_port=args.api_port,
-        ))
+        asyncio.run(
+            run_server_mode(
+                model_path=model_path,
+                rank=args.rank,
+                world_size=args.world_size,
+                node_addresses=node_addresses,
+                api_port=args.api_port,
+            )
+        )
     else:
-        asyncio.run(run_distributed_node(
-            model_path=model_path,
-            rank=args.rank,
-            world_size=args.world_size,
-            node_addresses=node_addresses,
-            prompt=args.prompt,
-            max_tokens=args.max_tokens,
-            interactive=args.interactive,
-        ))
+        asyncio.run(
+            run_distributed_node(
+                model_path=model_path,
+                rank=args.rank,
+                world_size=args.world_size,
+                node_addresses=node_addresses,
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+                interactive=args.interactive,
+            )
+        )
 
 
 if __name__ == "__main__":

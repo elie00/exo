@@ -1,501 +1,215 @@
-"""
-Tests for GPU-aware placement functionality.
-
-These tests verify that the placement system correctly uses GPU VRAM
-when available and falls back to RAM appropriately.
-"""
-
-from typing import Callable
+"""GPU placement contracts on the post-merge granular node state schema."""
 
 import pytest
 
 from exo.master.placement_utils import (
-    _get_cycle_effective_memory,
-    _get_node_effective_memory,
     filter_cycles_by_memory,
+    get_cycle_effective_memory,
+    get_node_effective_memory,
     get_shard_assignments,
 )
-from exo.shared.topology import Topology
+from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
-from exo.shared.types.models import ModelId, ModelMetadata
-from exo.shared.types.profiling import (
-    MemoryPerformanceProfile,
-    NodePerformanceProfile,
-    SystemPerformanceProfile,
-)
-from exo.shared.types.topology import Connection, NodeInfo
+from exo.shared.types.profiling import MemoryUsage, SystemPerformanceProfile
+from exo.shared.types.topology import Cycle
 from exo.shared.types.worker.shards import Sharding
 
 
-def create_node_with_gpu(
-    ram_mb: int,
-    gpu_memory_total_mb: int,
-    gpu_memory_used_mb: int,
-    node_id: NodeId | None = None,
-) -> NodeInfo:
-    """Create a node with both RAM and GPU memory."""
-    if node_id is None:
-        node_id = NodeId()
-    return NodeInfo(
-        node_id=node_id,
-        node_profile=NodePerformanceProfile(
-            model_id="test",
-            chip_id="test",
-            friendly_name="test",
-            memory=MemoryPerformanceProfile.from_bytes(
-                ram_total=ram_mb * 1024 * 1024,
-                ram_available=ram_mb * 1024 * 1024,
-                swap_total=0,
-                swap_available=0,
-            ),
-            network_interfaces=[],
-            system=SystemPerformanceProfile(
-                gpu_memory_total_mb=gpu_memory_total_mb,
-                gpu_memory_used_mb=gpu_memory_used_mb,
-                gpu_count=1,
-                driver_version="535.154.05",
-                cuda_version="12.2",
-            ),
+def node_memory(
+    ram_mb: int, gpu_total_mb: int | None = None, gpu_used_mb: int | None = None
+) -> MemoryUsage:
+    return MemoryUsage.from_bytes(
+        ram_total=ram_mb * 1024**2,
+        ram_available=ram_mb * 1024**2,
+        swap_total=0,
+        swap_available=0,
+        gpu_vram_total=gpu_total_mb * 1024**2 if gpu_total_mb is not None else None,
+        gpu_vram_used=gpu_used_mb * 1024**2 if gpu_used_mb is not None else None,
+        gpu_vram_available=(
+            max(0, gpu_total_mb - gpu_used_mb) * 1024**2
+            if gpu_total_mb is not None and gpu_used_mb is not None
+            else None
         ),
     )
 
 
-def create_node_cpu_only(
-    ram_mb: int,
-    node_id: NodeId | None = None,
-) -> NodeInfo:
-    """Create a CPU-only node (no GPU memory)."""
-    if node_id is None:
-        node_id = NodeId()
-    return NodeInfo(
-        node_id=node_id,
-        node_profile=NodePerformanceProfile(
-            model_id="test",
-            chip_id="test",
-            friendly_name="test",
-            memory=MemoryPerformanceProfile.from_bytes(
-                ram_total=ram_mb * 1024 * 1024,
-                ram_available=ram_mb * 1024 * 1024,
-                swap_total=0,
-                swap_available=0,
-            ),
-            network_interfaces=[],
-            system=SystemPerformanceProfile(),  # No GPU fields
-        ),
+@pytest.mark.parametrize(
+    "memory,prefer_gpu,expected_mb",
+    [
+        (node_memory(32000, 24000, 4000), True, 20000),
+        (node_memory(32000, 24000, 4000), False, 32000),
+        (node_memory(64000), True, 64000),
+        (node_memory(64000, 24000, 24000), True, 0),
+        (node_memory(64000, 24000, None), True, 0),
+    ],
+)
+def test_node_effective_memory(
+    memory: MemoryUsage, prefer_gpu: bool, expected_mb: int
+) -> None:
+    result = get_node_effective_memory(memory, prefer_gpu=prefer_gpu)
+    assert result.in_mb == expected_mb
+
+
+@pytest.mark.parametrize(
+    "memories,prefer_gpu,expected_mb",
+    [
+        ([node_memory(32000, 24000, 0), node_memory(32000, 24000, 0)], True, 48000),
+        ([node_memory(32000, 24000, 0), node_memory(64000)], True, 96000),
+        ([node_memory(32000, 24000, 0), node_memory(32000, 24000, 0)], False, 64000),
+    ],
+)
+def test_cycle_memory_uses_one_consistent_domain(
+    memories: list[MemoryUsage], prefer_gpu: bool, expected_mb: int
+) -> None:
+    memory_by_node = {NodeId(): memory for memory in memories}
+    cycle = Cycle(node_ids=list(memory_by_node))
+    result = get_cycle_effective_memory(cycle, memory_by_node, prefer_gpu=prefer_gpu)
+    assert result.in_mb == expected_mb
+
+
+@pytest.mark.parametrize(
+    "memories,required_mb,accepted",
+    [
+        ([node_memory(32000, 24000, 0), node_memory(32000, 24000, 0)], 40000, True),
+        ([node_memory(128000, 24000, 0), node_memory(128000, 24000, 0)], 60000, False),
+        ([node_memory(32000, 24000, 0), node_memory(64000)], 90000, True),
+    ],
+)
+def test_filter_cycles_gpu_memory(
+    memories: list[MemoryUsage], required_mb: int, accepted: bool
+) -> None:
+    memory_by_node = {NodeId(): memory for memory in memories}
+    cycle = Cycle(node_ids=list(memory_by_node))
+    result = filter_cycles_by_memory(
+        [cycle], memory_by_node, Memory.from_mb(required_mb), prefer_gpu=True
+    )
+    assert result == ([cycle] if accepted else [])
+
+
+def test_filter_does_not_place_node_with_missing_telemetry() -> None:
+    cycle = Cycle(node_ids=[NodeId(), NodeId()])
+    assert (
+        filter_cycles_by_memory(
+            [cycle],
+            {cycle.node_ids[0]: node_memory(64000)},
+            Memory.from_mb(1),
+            prefer_gpu=True,
+        )
+        == []
     )
 
 
-class TestGetNodeEffectiveMemory:
-    """Tests for _get_node_effective_memory function."""
+@pytest.mark.parametrize("prefer_gpu", [True, False])
+def test_shard_distribution_respects_selected_memory_domain(prefer_gpu: bool) -> None:
+    nodes = [NodeId(), NodeId()]
+    memory_by_node = {
+        nodes[0]: node_memory(64000, 12000, 0),
+        nodes[1]: node_memory(32000, 24000, 0),
+    }
+    model_card = ModelCard(
+        model_id=ModelId("test-model"),
+        storage_size=Memory.from_mb(30000),
+        n_layers=12,
+        hidden_size=4096,
+        supports_tensor=True,
+    )
+    assignments = get_shard_assignments(
+        model_card,
+        Cycle(node_ids=nodes),
+        Sharding.Pipeline,
+        memory_by_node,
+        prefer_gpu=prefer_gpu,
+    )
+    shards = [
+        assignments.runner_to_shard[assignments.node_to_runner[node]] for node in nodes
+    ]
+    assert [(shard.start_layer, shard.end_layer) for shard in shards] == (
+        [(0, 4), (4, 12)] if prefer_gpu else [(0, 8), (8, 12)]
+    )
 
-    def test_gpu_node_prefer_gpu_returns_vram(self):
-        """When prefer_gpu=True and node has GPU, return VRAM."""
-        node = create_node_with_gpu(
-            ram_mb=32000,  # 32GB RAM
-            gpu_memory_total_mb=24000,  # 24GB VRAM
-            gpu_memory_used_mb=4000,  # 4GB used
-        )
-        # Create a NodeWithProfile-like object
-        from exo.master.placement_utils import NodeWithProfile
 
-        node_with_profile = NodeWithProfile(
-            node_id=node.node_id,
-            node_profile=node.node_profile,  # type: ignore
-        )
-
-        memory = _get_node_effective_memory(node_with_profile, prefer_gpu=True)
-
-        # Should return available VRAM (24000 - 4000 = 20000 MB)
-        assert memory.in_mb == pytest.approx(20000, rel=0.01)
-
-    def test_gpu_node_prefer_ram_returns_ram(self):
-        """When prefer_gpu=False, return RAM even if GPU is available."""
-        node = create_node_with_gpu(
-            ram_mb=32000,  # 32GB RAM
-            gpu_memory_total_mb=24000,  # 24GB VRAM
-            gpu_memory_used_mb=4000,
-        )
-        from exo.master.placement_utils import NodeWithProfile
-
-        node_with_profile = NodeWithProfile(
-            node_id=node.node_id,
-            node_profile=node.node_profile,  # type: ignore
-        )
-
-        memory = _get_node_effective_memory(node_with_profile, prefer_gpu=False)
-
-        # Should return RAM
-        assert memory.in_mb == pytest.approx(32000, rel=0.01)
-
-    def test_cpu_only_node_returns_ram(self):
-        """CPU-only nodes always return RAM."""
-        node = create_node_cpu_only(ram_mb=64000)  # 64GB RAM
-        from exo.master.placement_utils import NodeWithProfile
-
-        node_with_profile = NodeWithProfile(
-            node_id=node.node_id,
-            node_profile=node.node_profile,  # type: ignore
+def test_shards_reject_exhausted_gpu_even_when_host_has_memory() -> None:
+    node = NodeId()
+    model = ModelCard(
+        model_id=ModelId("test-model"),
+        storage_size=Memory.from_mb(100),
+        n_layers=2,
+        hidden_size=64,
+        supports_tensor=False,
+    )
+    with pytest.raises(ValueError, match="available memory is 0"):
+        get_shard_assignments(
+            model,
+            Cycle(node_ids=[node]),
+            Sharding.Pipeline,
+            {node: node_memory(64000, 24000, 24000)},
+            prefer_gpu=True,
         )
 
-        memory = _get_node_effective_memory(node_with_profile, prefer_gpu=True)
 
-        # Should return RAM since no GPU
-        assert memory.in_mb == pytest.approx(64000, rel=0.01)
-
-
-class TestGetCycleEffectiveMemory:
-    """Tests for _get_cycle_effective_memory function."""
-
-    def test_all_gpu_nodes_prefer_gpu_returns_total_vram(self):
-        """When all nodes have GPU and prefer_gpu=True, return total VRAM."""
-        from exo.master.placement_utils import NodeWithProfile
-
-        nodes = [
-            create_node_with_gpu(
-                ram_mb=32000, gpu_memory_total_mb=24000, gpu_memory_used_mb=0
-            ),
-            create_node_with_gpu(
-                ram_mb=32000, gpu_memory_total_mb=24000, gpu_memory_used_mb=0
-            ),
-        ]
-        cycle = [
-            NodeWithProfile(node_id=n.node_id, node_profile=n.node_profile)  # type: ignore
-            for n in nodes
-        ]
-
-        memory = _get_cycle_effective_memory(cycle, prefer_gpu=True)
-
-        # Should return total VRAM (24000 + 24000 = 48000 MB)
-        assert memory.in_mb == pytest.approx(48000, rel=0.01)
-
-    def test_mixed_gpu_cpu_nodes_returns_ram(self):
-        """When nodes are mixed (some GPU, some CPU), return RAM."""
-        from exo.master.placement_utils import NodeWithProfile
-
-        nodes = [
-            create_node_with_gpu(
-                ram_mb=32000, gpu_memory_total_mb=24000, gpu_memory_used_mb=0
-            ),
-            create_node_cpu_only(ram_mb=64000),  # CPU only
-        ]
-        cycle = [
-            NodeWithProfile(node_id=n.node_id, node_profile=n.node_profile)  # type: ignore
-            for n in nodes
-        ]
-
-        memory = _get_cycle_effective_memory(cycle, prefer_gpu=True)
-
-        # Should return total RAM (32000 + 64000 = 96000 MB)
-        assert memory.in_mb == pytest.approx(96000, rel=0.01)
-
-    def test_all_gpu_nodes_prefer_ram_returns_ram(self):
-        """When prefer_gpu=False, return RAM even with all GPU nodes."""
-        from exo.master.placement_utils import NodeWithProfile
-
-        nodes = [
-            create_node_with_gpu(
-                ram_mb=32000, gpu_memory_total_mb=24000, gpu_memory_used_mb=0
-            ),
-            create_node_with_gpu(
-                ram_mb=32000, gpu_memory_total_mb=24000, gpu_memory_used_mb=0
-            ),
-        ]
-        cycle = [
-            NodeWithProfile(node_id=n.node_id, node_profile=n.node_profile)  # type: ignore
-            for n in nodes
-        ]
-
-        memory = _get_cycle_effective_memory(cycle, prefer_gpu=False)
-
-        # Should return total RAM (32000 + 32000 = 64000 MB)
-        assert memory.in_mb == pytest.approx(64000, rel=0.01)
-
-
-class TestFilterCyclesByMemoryGpu:
-    """Tests for filter_cycles_by_memory with GPU memory."""
-
-    @pytest.fixture
-    def topology(self) -> Topology:
-        return Topology()
-
-    def test_gpu_cycle_passes_vram_filter(
-        self,
-        topology: Topology,
-        create_connection: Callable[[NodeId, NodeId], Connection],
-    ):
-        """A cycle with sufficient VRAM should pass when prefer_gpu=True."""
-        node1_id = NodeId()
-        node2_id = NodeId()
-
-        # Each node has 24GB VRAM, 32GB RAM
-        node1 = create_node_with_gpu(
-            ram_mb=32000,
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=0,
-            node_id=node1_id,
-        )
-        node2 = create_node_with_gpu(
-            ram_mb=32000,
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=0,
-            node_id=node2_id,
-        )
-
-        topology.add_node(node1)
-        topology.add_node(node2)
-        topology.add_connection(create_connection(node1_id, node2_id))
-        topology.add_connection(create_connection(node2_id, node1_id))
-
-        cycles = topology.get_cycles()
-
-        # Require 40GB - should pass with VRAM (48GB total), fail with RAM if it were less
-        filtered = filter_cycles_by_memory(
-            cycles, Memory.from_mb(40000), prefer_gpu=True
-        )
-
-        assert len(filtered) == 1
-
-    def test_gpu_cycle_fails_insufficient_vram(
-        self,
-        topology: Topology,
-        create_connection: Callable[[NodeId, NodeId], Connection],
-    ):
-        """A cycle with insufficient VRAM should fail when prefer_gpu=True."""
-        node1_id = NodeId()
-        node2_id = NodeId()
-
-        # Each node has 24GB VRAM (48GB total)
-        node1 = create_node_with_gpu(
-            ram_mb=128000,
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=0,
-            node_id=node1_id,
-        )
-        node2 = create_node_with_gpu(
-            ram_mb=128000,
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=0,
-            node_id=node2_id,
-        )
-
-        topology.add_node(node1)
-        topology.add_node(node2)
-        topology.add_connection(create_connection(node1_id, node2_id))
-        topology.add_connection(create_connection(node2_id, node1_id))
-
-        cycles = topology.get_cycles()
-
-        # Require 60GB - should fail (only 48GB VRAM)
-        # Even though there's 256GB RAM, we use VRAM when prefer_gpu=True and all have GPU
-        filtered = filter_cycles_by_memory(
-            cycles, Memory.from_mb(60000), prefer_gpu=True
-        )
-
-        assert len(filtered) == 0
-
-    def test_mixed_cycle_uses_ram(
-        self,
-        topology: Topology,
-        create_connection: Callable[[NodeId, NodeId], Connection],
-    ):
-        """A mixed GPU/CPU cycle should use RAM even with prefer_gpu=True."""
-        node1_id = NodeId()
-        node2_id = NodeId()
-
-        # Node 1 has GPU (24GB VRAM, 32GB RAM)
-        node1 = create_node_with_gpu(
-            ram_mb=32000,
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=0,
-            node_id=node1_id,
-        )
-        # Node 2 is CPU only (64GB RAM)
-        node2 = create_node_cpu_only(ram_mb=64000, node_id=node2_id)
-
-        topology.add_node(node1)
-        topology.add_node(node2)
-        topology.add_connection(create_connection(node1_id, node2_id))
-        topology.add_connection(create_connection(node2_id, node1_id))
-
-        cycles = topology.get_cycles()
-
-        # Require 90GB - should pass with RAM (96GB total)
-        # Would fail if using VRAM (only 24GB from node1)
-        filtered = filter_cycles_by_memory(
-            cycles, Memory.from_mb(90000), prefer_gpu=True
-        )
-
-        assert len(filtered) == 1
-
-
-class TestShardAssignmentsGpu:
-    """Tests for GPU-aware shard assignments."""
-
-    @pytest.fixture
-    def topology(self) -> Topology:
-        return Topology()
-
-    def test_shard_distribution_by_vram(
-        self,
-        topology: Topology,
-        create_connection: Callable[[NodeId, NodeId], Connection],
-    ):
-        """Shards should be distributed proportionally to VRAM when prefer_gpu=True."""
-        node1_id = NodeId()
-        node2_id = NodeId()
-
-        # Node 1: 12GB VRAM, Node 2: 24GB VRAM (1:2 ratio)
-        node1 = create_node_with_gpu(
-            ram_mb=32000,
-            gpu_memory_total_mb=12000,
-            gpu_memory_used_mb=0,
-            node_id=node1_id,
-        )
-        node2 = create_node_with_gpu(
-            ram_mb=32000,
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=0,
-            node_id=node2_id,
-        )
-
-        topology.add_node(node1)
-        topology.add_node(node2)
-        topology.add_connection(create_connection(node1_id, node2_id))
-        topology.add_connection(create_connection(node2_id, node1_id))
-
-        model_meta = ModelMetadata(
-            model_id=ModelId("test-model"),
-            pretty_name="Test Model",
-            n_layers=12,
-            storage_size=Memory.from_mb(30000),
-            hidden_size=4096,
-            supports_tensor=True,
-        )
-
-        cycles = topology.get_cycles()
-        selected_cycle = cycles[0]
-
-        shard_assignments = get_shard_assignments(
-            model_meta, selected_cycle, Sharding.Pipeline, prefer_gpu=True
-        )
-
-        # Get layer counts for each node
-        runner_id_1 = shard_assignments.node_to_runner[node1_id]
-        runner_id_2 = shard_assignments.node_to_runner[node2_id]
-
-        shard_1 = shard_assignments.runner_to_shard[runner_id_1]
-        shard_2 = shard_assignments.runner_to_shard[runner_id_2]
-
-        layers_1 = shard_1.end_layer - shard_1.start_layer
-        layers_2 = shard_2.end_layer - shard_2.start_layer
-
-        # With 1:2 ratio, expect ~4 layers for node1, ~8 layers for node2
-        assert layers_1 + layers_2 == 12
-        assert layers_1 == pytest.approx(4, abs=1)
-        assert layers_2 == pytest.approx(8, abs=1)
-
-    def test_shard_distribution_by_ram_when_prefer_gpu_false(
-        self,
-        topology: Topology,
-        create_connection: Callable[[NodeId, NodeId], Connection],
-    ):
-        """Shards should be distributed by RAM when prefer_gpu=False."""
-        node1_id = NodeId()
-        node2_id = NodeId()
-
-        # Node 1: 12GB VRAM, 32GB RAM; Node 2: 24GB VRAM, 64GB RAM
-        # VRAM ratio 1:2, RAM ratio 1:2
-        node1 = create_node_with_gpu(
-            ram_mb=32000,
-            gpu_memory_total_mb=48000,
-            gpu_memory_used_mb=0,
-            node_id=node1_id,
-        )
-        node2 = create_node_with_gpu(
-            ram_mb=64000,
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=0,
-            node_id=node2_id,
-        )
-
-        topology.add_node(node1)
-        topology.add_node(node2)
-        topology.add_connection(create_connection(node1_id, node2_id))
-        topology.add_connection(create_connection(node2_id, node1_id))
-
-        model_meta = ModelMetadata(
-            model_id=ModelId("test-model"),
-            pretty_name="Test Model",
-            n_layers=12,
-            storage_size=Memory.from_mb(80000),
-            hidden_size=4096,
-            supports_tensor=True,
-        )
-
-        cycles = topology.get_cycles()
-        selected_cycle = cycles[0]
-
-        shard_assignments = get_shard_assignments(
-            model_meta, selected_cycle, Sharding.Pipeline, prefer_gpu=False
-        )
-
-        runner_id_1 = shard_assignments.node_to_runner[node1_id]
-        runner_id_2 = shard_assignments.node_to_runner[node2_id]
-
-        shard_1 = shard_assignments.runner_to_shard[runner_id_1]
-        shard_2 = shard_assignments.runner_to_shard[runner_id_2]
-
-        layers_1 = shard_1.end_layer - shard_1.start_layer
-        layers_2 = shard_2.end_layer - shard_2.start_layer
-
-        # With RAM ratio 1:2, expect ~4 layers for node1, ~8 layers for node2
-        assert layers_1 + layers_2 == 12
-        assert layers_1 == pytest.approx(4, abs=1)
-        assert layers_2 == pytest.approx(8, abs=1)
-
-
-class TestSystemPerformanceProfileGpu:
-    """Tests for GPU-related properties in SystemPerformanceProfile."""
-
-    def test_has_gpu_memory_true(self):
-        """has_gpu_memory returns True when GPU memory is set."""
-        profile = SystemPerformanceProfile(
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=4000,
-        )
-        assert profile.has_gpu_memory is True
-
-    def test_has_gpu_memory_false_when_none(self):
-        """has_gpu_memory returns False when GPU memory is None."""
-        profile = SystemPerformanceProfile()
-        assert profile.has_gpu_memory is False
-
-    def test_has_gpu_memory_false_when_zero(self):
-        """has_gpu_memory returns False when GPU memory is 0."""
-        profile = SystemPerformanceProfile(
-            gpu_memory_total_mb=0,
-            gpu_memory_used_mb=0,
-        )
-        assert profile.has_gpu_memory is False
-
-    def test_gpu_memory_available_mb(self):
-        """gpu_memory_available_mb calculates correctly."""
-        profile = SystemPerformanceProfile(
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=4000,
-        )
-        assert profile.gpu_memory_available_mb == 20000
-
-    def test_gpu_memory_available_mb_zero_when_none(self):
-        """gpu_memory_available_mb returns 0 when no GPU."""
-        profile = SystemPerformanceProfile()
-        assert profile.gpu_memory_available_mb == 0
-
-    def test_gpu_memory_available_mb_never_negative(self):
-        """gpu_memory_available_mb never returns negative."""
-        profile = SystemPerformanceProfile(
-            gpu_memory_total_mb=24000,
-            gpu_memory_used_mb=30000,  # More used than total (edge case)
-        )
-        assert profile.gpu_memory_available_mb == 0
+def test_zero_vram_samples_survive_serialization() -> None:
+    memory = node_memory(64000, 24000, 0)
+    assert memory.gpu_vram_used == Memory()
+    roundtrip = MemoryUsage.model_validate_json(memory.model_dump_json())
+    assert roundtrip.gpu_vram_used == Memory()
+    exhausted = node_memory(64000, 24000, 24000)
+    assert exhausted.gpu_vram_available == Memory()
+    assert (
+        MemoryUsage.model_validate_json(exhausted.model_dump_json()).gpu_vram_available
+        == Memory()
+    )
+
+
+@pytest.mark.parametrize(
+    "total,used,has_memory,available",
+    [
+        (24000, 4000, True, 20000),
+        (None, None, False, 0),
+        (0, 0, False, 0),
+        (24000, 30000, True, 0),
+    ],
+)
+def test_system_performance_profile_gpu_properties(
+    total: int | None, used: int | None, has_memory: bool, available: int
+) -> None:
+    profile = SystemPerformanceProfile(
+        gpu_memory_total_mb=total, gpu_memory_used_mb=used
+    )
+    assert profile.has_gpu_memory is has_memory
+    assert profile.gpu_memory_available_mb == available
+
+
+def test_master_placement_respects_prefer_gpu_and_rejects_unwired_gguf() -> None:
+    from exo.master.placement import place_instance
+    from exo.master.tests.conftest import create_node_network
+    from exo.shared.topology import Topology
+    from exo.shared.types.commands import PlaceInstance
+    from exo.shared.types.worker.instances import InstanceMeta
+
+    node = NodeId()
+    topology = Topology()
+    topology.add_node(node)
+    model = ModelCard(
+        model_id=ModelId("test"),
+        storage_size=Memory.from_mb(1000),
+        n_layers=4,
+        hidden_size=128,
+        supports_tensor=False,
+    )
+    command = PlaceInstance(
+        model_card=model,
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxRing,
+        min_nodes=1,
+        prefer_gpu=True,
+    )
+    memory = {node: node_memory(64000, 2000, 2000)}
+    network = {node: create_node_network()}
+    with pytest.raises(ValueError, match="sufficient memory"):
+        place_instance(command, topology, {}, memory, network)
+    command.prefer_gpu = False
+    assert len(place_instance(command, topology, {}, memory, network)) == 1
+    command.instance_meta = InstanceMeta.GGUFPipeline
+    with pytest.raises(ValueError, match="GGUF pipeline placement"):
+        place_instance(command, topology, {}, memory, network)

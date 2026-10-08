@@ -17,19 +17,54 @@ from exo.shared.types.worker.shards import (
 )
 
 
+def get_node_effective_memory(memory: MemoryUsage, *, prefer_gpu: bool) -> Memory:
+    """Return available memory in the explicitly selected execution domain.
+
+    A known GPU with missing free-memory telemetry is not an invitation to use
+    host RAM. Treat its available VRAM as zero until a complete sample arrives.
+    """
+    if prefer_gpu and memory.has_gpu_vram:
+        return memory.gpu_vram_available or Memory()
+    return memory.ram_available
+
+
+def _cycle_uses_gpu_memory(
+    cycle: Cycle, node_memory: Mapping[NodeId, MemoryUsage], *, prefer_gpu: bool
+) -> bool:
+    return prefer_gpu and all(node_memory[node].has_gpu_vram for node in cycle)
+
+
+def get_cycle_effective_memory(
+    cycle: Cycle,
+    node_memory: Mapping[NodeId, MemoryUsage],
+    *,
+    prefer_gpu: bool,
+) -> Memory:
+    # Mixed CPU/GPU cycles use host memory consistently for every node.
+    use_gpu = _cycle_uses_gpu_memory(cycle, node_memory, prefer_gpu=prefer_gpu)
+    return sum(
+        (
+            get_node_effective_memory(node_memory[node], prefer_gpu=use_gpu)
+            for node in cycle
+        ),
+        start=Memory(),
+    )
+
+
 def filter_cycles_by_memory(
     cycles: list[Cycle],
     node_memory: Mapping[NodeId, MemoryUsage],
     required_memory: Memory,
+    *,
+    prefer_gpu: bool = False,
 ) -> list[Cycle]:
     filtered_cycles: list[Cycle] = []
     for cycle in cycles:
         if not all(node in node_memory for node in cycle):
             continue
 
-        total_mem = sum(
-            (node_memory[node_id].ram_available for node_id in cycle.node_ids),
-            start=Memory(),
+        total_mem = get_cycle_effective_memory(
+            cycle, node_memory, prefer_gpu=prefer_gpu
         )
         if total_mem >= required_memory:
             filtered_cycles.append(cycle)
@@ -78,14 +113,18 @@ def get_shard_assignments_for_pipeline_parallel(
     model_card: ModelCard,
     cycle: Cycle,
     node_memory: Mapping[NodeId, MemoryUsage],
+    *,
+    prefer_gpu: bool = False,
 ):
     if not cycle.node_ids:
         raise ValueError("Cannot create shard assignments for empty node cycle")
 
-    cycle_memory = sum(
-        (node_memory[node_id].ram_available for node_id in cycle.node_ids),
-        start=Memory(),
-    )
+    use_gpu = _cycle_uses_gpu_memory(cycle, node_memory, prefer_gpu=prefer_gpu)
+    available_by_node = {
+        node: get_node_effective_memory(node_memory[node], prefer_gpu=use_gpu)
+        for node in cycle
+    }
+    cycle_memory = sum(available_by_node.values(), start=Memory())
     if cycle_memory.in_bytes == 0:
         raise ValueError("Cannot create shard assignments: total available memory is 0")
 
@@ -97,7 +136,7 @@ def get_shard_assignments_for_pipeline_parallel(
     layer_allocations = allocate_layers_proportionally(
         total_layers=total_layers,
         memory_fractions=[
-            node_memory[node_id].ram_available.in_bytes / cycle_memory.in_bytes
+            available_by_node[node_id].in_bytes / cycle_memory.in_bytes
             for node_id in cycle.node_ids
         ],
     )
@@ -108,7 +147,7 @@ def get_shard_assignments_for_pipeline_parallel(
         zip(cycle.node_ids, layer_allocations, strict=True)
     ):
         required_memory = node_layers * memory_per_layer
-        available_memory = node_memory[node_id].ram_available.in_bytes
+        available_memory = available_by_node[node_id].in_bytes
         if required_memory > available_memory:
             raise ValueError(
                 f"Node {i} ({node_id}) has insufficient memory: "
@@ -182,6 +221,8 @@ def get_shard_assignments(
     cycle: Cycle,
     sharding: Sharding,
     node_memory: Mapping[NodeId, MemoryUsage],
+    *,
+    prefer_gpu: bool = False,
 ) -> ShardAssignments:
     match sharding:
         case Sharding.Pipeline:
@@ -189,6 +230,7 @@ def get_shard_assignments(
                 model_card=model_card,
                 cycle=cycle,
                 node_memory=node_memory,
+                prefer_gpu=prefer_gpu,
             )
         case Sharding.Tensor:
             return get_shard_assignments_for_tensor_parallel(

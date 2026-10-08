@@ -40,9 +40,15 @@ class MemoryUsage(CamelCaseModel):
             ram_available=Memory.from_bytes(ram_available),
             swap_total=Memory.from_bytes(swap_total),
             swap_available=Memory.from_bytes(swap_available),
-            gpu_vram_total=Memory.from_bytes(gpu_vram_total) if gpu_vram_total else None,
-            gpu_vram_available=Memory.from_bytes(gpu_vram_available) if gpu_vram_available else None,
-            gpu_vram_used=Memory.from_bytes(gpu_vram_used) if gpu_vram_used else None,
+            gpu_vram_total=Memory.from_bytes(gpu_vram_total)
+            if gpu_vram_total is not None
+            else None,
+            gpu_vram_available=Memory.from_bytes(gpu_vram_available)
+            if gpu_vram_available is not None
+            else None,
+            gpu_vram_used=Memory.from_bytes(gpu_vram_used)
+            if gpu_vram_used is not None
+            else None,
         )
 
     @classmethod

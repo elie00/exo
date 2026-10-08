@@ -19,6 +19,16 @@ exo: Run your own AI cluster at home with everyday devices. Maintained by [exo l
 
 exo connects all your devices into an AI cluster. Not only does exo enable running models larger than would fit on a single device, but with [day-0 support for RDMA over Thunderbolt](https://x.com/exolabs/status/2001817749744476256?s=20), makes models run faster as you add more devices.
 
+## About this fork
+
+This is Elie's contribution fork of [exo-explore/exo](https://github.com/exo-explore/exo).
+The upstream engine and performance claims below belong to that project. This
+fork's current work repairs NVIDIA telemetry, GPU-memory placement and optional
+GGUF integration after an upstream schema change. Read the
+[repair and validation report](docs/fork-integration-repair.md) for reproducible
+checks and the distinction between working adapters, prototypes and hardware
+qualification. The GGUF TCP relay is not weight-sharded inference.
+
 ## Features
 
 - **Automatic Device Discovery**: Devices running exo automatically discover each other - no manual configuration.
@@ -401,7 +411,7 @@ The tool outputs performance metrics including prompt tokens per second (prompt_
 ## Hardware Accelerator Support
 
 - **macOS**: exo uses Metal GPU acceleration via MLX.
-- **Linux with NVIDIA GPU**: exo supports NVIDIA GPUs with CUDA. See [Linux NVIDIA GPU Support](#linux-nvidia-gpu-support) below.
+- **Linux with NVIDIA GPU**: this fork contains experimental telemetry and GGUF detection; see the qualification limits in [Linux NVIDIA GPU Support](#linux-nvidia-gpu-support).
 - **Linux without GPU**: exo falls back to CPU inference.
 
 If you'd like support for a new hardware platform, please [search for an existing feature request](https://github.com/exo-explore/exo/issues) and add a thumbs up so we know what hardware is important to the community.
@@ -410,50 +420,20 @@ If you'd like support for a new hardware platform, please [search for an existin
 
 ## Linux NVIDIA GPU Support
 
-exo includes experimental support for NVIDIA GPUs on Linux. When running on a system with NVIDIA GPUs:
+This fork contributes an optional NVML collector and GGUF device detection to
+upstream exo. The collector reports readable VRAM, utilization, temperature and
+power; unavailable sensors are `null`, and partially readable systems list the
+missing GPU indices. Concurrent polls share one initialized NVML session.
 
-- **Automatic Detection**: exo automatically detects NVIDIA GPUs and their available VRAM.
-- **GPU-Aware Placement**: Model shards are distributed across nodes based on available GPU memory (VRAM) when all nodes in a cluster have GPUs.
-- **Fallback to RAM**: For mixed clusters (some nodes with GPUs, some without), exo uses RAM-based placement for compatibility.
+See [NVIDIA telemetry](docs/nvidia-telemetry.md) for the measurement contract,
+hardware-free tests, optional `nvidia-ml-py` bindings and a physical-host snapshot
+command. The older `uv sync --extra cuda` instruction is not valid for this
+checkout: its `cuda` extra is commented out in `pyproject.toml`.
 
-### Requirements
-
-- Linux with NVIDIA GPU(s)
-- NVIDIA driver installed (version 470+)
-- CUDA toolkit (optional, but recommended for best performance)
-
-### Installation with CUDA Support
-
-```bash
-# Clone exo
-git clone https://github.com/exo-explore/exo
-cd exo
-
-# Install with CUDA support
-uv sync --extra cuda
-
-# Build dashboard
-cd dashboard && npm install && npm run build && cd ..
-
-# Run exo
-uv run exo
-```
-
-### Verifying GPU Detection
-
-When exo starts on a system with NVIDIA GPUs, you should see GPU information in the logs. The dashboard will also display GPU memory information for each node.
-
-### GPU Placement Preferences
-
-By default, exo prefers GPU VRAM over system RAM when placing model shards. You can control this behavior via the API:
-
-```bash
-# Get placement using GPU memory (default)
-curl "http://localhost:52415/instance/placement?model_id=llama-3.2-1b&prefer_gpu=true"
-
-# Get placement using system RAM
-curl "http://localhost:52415/instance/placement?model_id=llama-3.2-1b&prefer_gpu=false"
-```
+Telemetry does not demonstrate working CUDA inference. After the upstream
+directory move, the collector is not connected to the main `InfoGatherer` event
+stream. Dashboard GPU values, placement and multi-node NVIDIA execution therefore
+remain to be integrated and qualified independently on physical hardware.
 
 ---
 

@@ -1,14 +1,14 @@
 """GGUF/Ollama backend for EXO distributed inference.
 
-This module provides complete support for running Ollama/GGUF models across
-multiple nodes with TRUE weight sharding (layer-level distribution).
+This module provides local GGUF discovery, metadata, inference adapters and
+experimental networking scaffolding. True weight sharding is not implemented.
 
 Key Features:
 - Automatic discovery of local Ollama models
 - GGUF file parsing for model architecture and tensor info
 - Layer-based sharding calculation for multi-node distribution
-- Distributed pipeline parallel inference with TCP activation passing
-- Full integration with EXO's instance and runner systems
+- Experimental TCP token relay with a versioned numeric payload format
+- Model-card compatibility with EXO; master GGUF placement remains unsupported
 
 Quick Start:
     # Discover available models
@@ -37,61 +37,60 @@ CLI Usage:
 """
 
 # Model discovery
-from exo.worker.engines.gguf.ollama_discovery import (
-    OllamaModel,
-    discover_ollama_models,
-    discover_ollama_models_async,
-    get_ollama_model_path,
-    get_ollama_home,
-    get_ollama_models_dir,
-)
-
-# GGUF file parsing
-from exo.worker.engines.gguf.gguf_loader import (
-    GGUFModelInfo,
-    TensorInfo,
-    GGMLType,
-    GGUFValueType,
-    load_gguf_metadata,
-    load_gguf_metadata_async,
-    get_layer_count,
-)
-
-# Sharding calculation
-from exo.worker.engines.gguf.gguf_sharding import (
-    GGUFShardAssignment,
-    GGUFShardingPlan,
-    calculate_shard_assignments,
-    estimate_shard_memory,
-    GGUFLayerLoader,
-)
-
 # Distributed pipeline
 from exo.worker.engines.gguf.distributed_pipeline import (
-    NodeRole,
-    PipelineNodeConfig,
     ActivationPacket,
     ActivationTransport,
-    TCPActivationTransport,
-    GGUFLayerExtractor,
     DistributedGGUFPipeline,
+    GGUFLayerExtractor,
+    NodeRole,
+    PipelineNodeConfig,
+    TCPActivationTransport,
     create_distributed_pipeline,
 )
 
 # EXO integration
 from exo.worker.engines.gguf.exo_integration import (
-    ollama_model_to_metadata,
+    OllamaModelProvider,
     discover_and_register_ollama_models,
     get_ollama_model_cards,
-    OllamaModelProvider,
     get_ollama_provider,
+    ollama_model_to_metadata,
+)
+
+# GGUF file parsing
+from exo.worker.engines.gguf.gguf_loader import (
+    GGMLType,
+    GGUFModelInfo,
+    GGUFValueType,
+    TensorInfo,
+    get_layer_count,
+    load_gguf_metadata,
+    load_gguf_metadata_async,
 )
 
 # Runner for EXO
 from exo.worker.engines.gguf.gguf_runner import (
+    LLAMA_CPP_AVAILABLE,
     GGUFRunner,
     gguf_runner_main,
-    LLAMA_CPP_AVAILABLE,
+)
+
+# Sharding calculation
+from exo.worker.engines.gguf.gguf_sharding import (
+    GGUFLayerLoader,
+    GGUFShardAssignment,
+    GGUFShardingPlan,
+    calculate_shard_assignments,
+    estimate_shard_memory,
+)
+from exo.worker.engines.gguf.ollama_discovery import (
+    OllamaModel,
+    discover_ollama_models,
+    discover_ollama_models_async,
+    get_ollama_home,
+    get_ollama_model_path,
+    get_ollama_models_dir,
 )
 
 __all__ = [
@@ -102,7 +101,6 @@ __all__ = [
     "get_ollama_model_path",
     "get_ollama_home",
     "get_ollama_models_dir",
-    
     # GGUF Parsing
     "GGUFModelInfo",
     "TensorInfo",
@@ -111,14 +109,12 @@ __all__ = [
     "load_gguf_metadata",
     "load_gguf_metadata_async",
     "get_layer_count",
-    
     # Sharding
     "GGUFShardAssignment",
     "GGUFShardingPlan",
     "calculate_shard_assignments",
     "estimate_shard_memory",
     "GGUFLayerLoader",
-    
     # Distributed Pipeline
     "NodeRole",
     "PipelineNodeConfig",
@@ -128,14 +124,12 @@ __all__ = [
     "GGUFLayerExtractor",
     "DistributedGGUFPipeline",
     "create_distributed_pipeline",
-    
     # EXO Integration
     "ollama_model_to_metadata",
     "discover_and_register_ollama_models",
     "get_ollama_model_cards",
     "OllamaModelProvider",
     "get_ollama_provider",
-    
     # Runner
     "GGUFRunner",
     "gguf_runner_main",
